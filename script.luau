@@ -1236,17 +1236,28 @@ end
 local TeleportService = game:GetService("TeleportService")
 local Reconnect = { conns = {}, token = 0, running = false, gaveUp = false, failed = false }
 
--- Calls cb(reason) when the client shows a disconnect/kick prompt. Returns the connections.
 local function watchDisconnect(cb)
 	local conns = {}
-	table.insert(conns, GuiService.ErrorMessageChanged:Connect(function(msg)
-		if type(msg) == "string" and msg ~= "" then cb(msg) end
-	end))
+	local ok, signal = pcall(function() return GuiService.ErrorMessageChanged end)
+	if ok and signal then
+		local connected, conn = pcall(function()
+			return signal:Connect(function(message)
+				if type(message) == "string" and message ~= "" then cb(message) end
+			end)
+		end)
+		if connected and conn then table.insert(conns, conn) end
+	end
+
 	pcall(function()
-		local overlay = game:GetService("CoreGui").RobloxPromptGui.promptOverlay
-		table.insert(conns, overlay.ChildAdded:Connect(function(child)
+		local coreGui = game:GetService("CoreGui")
+		local promptGui = coreGui:FindFirstChild("RobloxPromptGui")
+		local overlay = promptGui and promptGui:FindFirstChild("promptOverlay")
+		if not overlay then return end
+		local function inspect(child)
 			if child.Name == "ErrorPrompt" then cb("error prompt") end
-		end))
+		end
+		for _, child in ipairs(overlay:GetChildren()) do inspect(child) end
+		table.insert(conns, overlay.ChildAdded:Connect(inspect))
 	end)
 	return conns
 end
@@ -1260,34 +1271,34 @@ local function saveServer()
 end
 
 local function reconnectLoop(token)
-	local maxAttempts = CONFIG.ReconnectMaxAttempts
-	local currentAttempt = 1
+	local maxAttempts, currentAttempt = CONFIG.ReconnectMaxAttempts, 1
 	local delayTime = CONFIG.ReconnectDelay
-
-	local targetPlaceId = game.PlaceId
-	local targetJobId = game.JobId
+	local targetPlaceId, targetJobId = game.PlaceId, game.JobId
 
 	if hasFileApi() and isfile(CONFIG.ReconnectFile) then
 		pcall(function()
 			local saved = HttpService:JSONDecode(readfile(CONFIG.ReconnectFile))
-			if saved and saved.PlaceId == game.PlaceId then
+			if saved and saved.PlaceId == game.PlaceId and type(saved.JobId) == "string" then
 				targetJobId = saved.JobId
 			end
 		end)
 	end
 
-	local failConn = TeleportService.TeleportInitFailed:Connect(function()
-		Reconnect.failed = true
+	local failConn
+	pcall(function()
+		failConn = TeleportService.TeleportInitFailed:Connect(function(failedPlayer)
+			if failedPlayer == player then Reconnect.failed = true end
+		end)
 	end)
 
 	local connected = false
 	while currentAttempt <= maxAttempts do
 		task.wait(delayTime)
-		if token ~= Reconnect.token then break end -- toggled off in the meantime
+		if token ~= Reconnect.token then break end
 
 		Reconnect.failed = false
 		local success, err = pcall(function()
-			if targetJobId and targetJobId ~= "" and #Players:GetPlayers() > 1 then
+			if targetJobId and targetJobId ~= "" then
 				TeleportService:TeleportToPlaceInstance(targetPlaceId, targetJobId, player)
 			else
 				TeleportService:Teleport(targetPlaceId, player)
@@ -1295,7 +1306,6 @@ local function reconnectLoop(token)
 		end)
 
 		if success then
-			-- the call only starts the teleport: give TeleportInitFailed a few seconds to report a failure
 			for _ = 1, 20 do
 				task.wait(0.5)
 				if Reconnect.failed or token ~= Reconnect.token then break end
@@ -1305,19 +1315,20 @@ local function reconnectLoop(token)
 				connected = true
 				break
 			end
-			err = "teleport failed to start"
+			err = "Teleport failed to start"
 		end
 
 		warn(("[AutumnDice] Reconnect attempt %d/%d failed: %s"):format(currentAttempt, maxAttempts, tostring(err)))
+		if targetJobId and targetJobId ~= "" then targetJobId = nil end
 		currentAttempt += 1
-		delayTime = delayTime * CONFIG.ReconnectBackoff
+		delayTime *= CONFIG.ReconnectBackoff
 	end
 
-	failConn:Disconnect()
+	if failConn then failConn:Disconnect() end
 	if token ~= Reconnect.token then return end
 	Reconnect.running = false
 	if not connected then
-		Reconnect.gaveUp = true -- stop retrying until the toggle is switched off and on again
+		Reconnect.gaveUp = true
 		warn("[AutumnDice] Auto Reconnect gave up after " .. maxAttempts .. " attempts.")
 	end
 end
@@ -1326,14 +1337,19 @@ local function onReconnectNeeded(reason)
 	if Reconnect.running or Reconnect.gaveUp or not State.Features.AutoReconnect then return end
 	Reconnect.running = true
 	warn("[AutumnDice] Disconnected (" .. tostring(reason) .. "). Reconnecting...")
-	task.spawn(reconnectLoop, Reconnect.token)
+	task.spawn(function()
+		local ok, err = pcall(reconnectLoop, Reconnect.token)
+		if not ok then
+			Reconnect.running = false
+			warn("[AutumnDice] Auto Reconnect error: " .. tostring(err))
+		end
+	end)
 end
 
 local function setAutoReconnect(enabled)
-	-- any loop in flight sees the new token and stops
 	Reconnect.token += 1
 	Reconnect.running = false
-	for _, c in ipairs(Reconnect.conns) do pcall(function() c:Disconnect() end) end
+	for _, conn in ipairs(Reconnect.conns) do pcall(function() conn:Disconnect() end) end
 	Reconnect.conns = {}
 	if not enabled then return end
 
@@ -1341,7 +1357,6 @@ local function setAutoReconnect(enabled)
 	saveServer()
 	Reconnect.conns = watchDisconnect(onReconnectNeeded)
 end
-
 local setAutoClaim
 
 local function SetFeature(name, value)
