@@ -5,6 +5,36 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 
+----------------------------------------------------------------------
+-- Startup gate: do NOTHING until the game has fully loaded.
+-- After a rejoin / server hop the script can be executed while the game is still starting,
+-- and touching its modules, remotes or UI that early can break the game's own loading.
+----------------------------------------------------------------------
+local STARTUP_DELAY = 6   -- extra seconds of grace once everything below is ready
+do
+	if not game:IsLoaded() then game.Loaded:Wait() end
+
+	local lp = Players.LocalPlayer
+	while not lp do
+		task.wait(0.25)
+		lp = Players.LocalPlayer
+	end
+
+	lp:WaitForChild("PlayerGui")
+	ReplicatedStorage:WaitForChild("Framework", 60) -- the game's own controllers live here
+
+	local deadline = os.clock() + 30
+	while not lp.Character and os.clock() < deadline do
+		task.wait(0.25)
+	end
+	local char = lp.Character
+	if char then
+		char:WaitForChild("HumanoidRootPart", 15)
+	end
+
+	task.wait(STARTUP_DELAY)
+end
+
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
@@ -51,28 +81,15 @@ local CONFIG = {
 	--   IsRunActive = function() return SomeController.inRun() end,
 	IsRunActive = nil,
 
-	-- Optional: the GUI's "Floors Cleared / Best Floor / floor N" need the current floor of the run.
-	-- Set GetFloor to your game's own check (must return a number), or leave nil to auto-detect
-	-- through the TowerController functions listed below (only those that exist are tried).
-	--   GetFloor = function() return SomeController.currentFloor() end,
-	GetFloor = nil,
-
-	-- Auto Execute: where to reload THIS script from after a rejoin. Set ONE of the two.
-	--   ScriptUrl  = "https://raw.githubusercontent.com/you/repo/main/script.lua"
-	--   ScriptFile = "AutumnDice.lua"   (a file saved in your executor's workspace folder)
-	ScriptUrl = nil,
-	ScriptFile = "AutumnDice.lua", -- default: save this script as AutumnDice.lua in your executor's workspace folder
-	SettingsFile = "AutumnDice_Settings.json", -- toggle states are saved here for the restore after rejoin
-	-- Small gated loader written while Auto Execute is ON (deleted when it is turned OFF). Your autoexec
-	-- "Dice" loader runs every .txt in Dice/CustomLoadings on each join, which re-launches the script.
-	LoaderStub = "Dice/CustomLoadings/AutumnDice.txt",
+	-- Floors Cleared / Best Floor come from the game's own Towers.CompleteTowerFloor results.
+	-- Set to true to print every result's actions in the console (to check the numbers).
+	DebugTowerFloors = false,
 
 	-- Auto Reconnect
 	ReconnectFile = "AutumnDice_Server.json", -- remembers the server (PlaceId/JobId) to rejoin
 	ReconnectMaxAttempts = 5,
 	ReconnectDelay = 5,       -- seconds before the first attempt
 	ReconnectBackoff = 1.5,   -- the delay is multiplied by this after every failed attempt
-	FloorCandidates = { "getFloor", "getCurrentFloor", "currentFloor", "getFloorNumber" },
 	-- Auto-detection looks for these functions on TowerController (only if they exist).
 	RunActiveCandidates = { "isInTower", "isRunning", "isInRun", "hasActiveRun" },
 }
@@ -85,8 +102,8 @@ local TOWER_MODES = { "Single", "Best Leaf Tower" }
 local State = {
 	Features = {
 		AutoDice = false, AutoTower = false, AutoEquipBest = false,
-		-- Miscellaneous (GUI placeholders only, no logic attached yet)
-		AntiAfk = false, AutoReconnect = false, AutoExecute = false,
+		-- Miscellaneous
+		AntiAfk = false, AutoReconnect = false,
 	},
 	Status = "Idle",
 	Detail = "Enable \"Auto Roll Autumn Dice\" to start.",
@@ -102,15 +119,10 @@ local State = {
 		Runs = 0,          -- successful tower starts made by Auto Tower
 		Floors = 0,        -- floors cleared since the script started
 		Best = 0,          -- best floor seen
-		Floor = nil,       -- current floor (nil = unknown)
-		LastFloor = nil,   -- internal: previous floor reading
-		Tracking = false,  -- true once a floor reading has worked
-	},
-
-	-- Session reward collection: totals accumulate across every tower run
-	Rewards = {
-		totals = {},       -- [rewardName] = accumulated amount
-		order = {},        -- reward names in the order they were first earned
+		Floor = nil,       -- floors cleared in the current run (nil = no data yet)
+		Tracking = false,  -- true once the game has reported a floor
+		RunFloors = 0,     -- internal: floors cleared in the current run
+		RunEnded = false,  -- internal: the last run ended, the next floor starts a new one
 	},
 }
 
@@ -850,7 +862,8 @@ local function driveTower(mode, section, extra)
 		Tower.lockedSince = os.clock()
 		local S = State.TowerStats
 		S.Runs += 1
-		S.LastFloor = nil
+		S.RunFloors = 0
+		S.RunEnded = false
 		S.Floor = nil
 		notify()
 		SetTowerStatus(progressKey, detail)
@@ -869,41 +882,6 @@ local function driveTower(mode, section, extra)
 	end
 end
 
-local function readFloor()
-	if CONFIG.GetFloor then
-		local ok, result = pcall(CONFIG.GetFloor)
-		return (ok and type(result) == "number") and result or nil
-	end
-	if TowerController then
-		for _, fnName in ipairs(CONFIG.FloorCandidates) do
-			local fn = TowerController[fnName]
-			if type(fn) == "function" then
-				local ok, result = pcall(fn)
-				if ok and type(result) == "number" then
-					return result
-				end
-			end
-		end
-	end
-	return nil
-end
-
-local function trackFloor()
-	local S = State.TowerStats
-	local floor = readFloor()
-	if not floor or isRunActive() == false then return end
-
-	S.Tracking = true
-	local changed = (S.Floor ~= floor)
-	if S.LastFloor and floor > S.LastFloor then
-		S.Floors += floor - S.LastFloor
-	end
-	S.LastFloor = floor
-	S.Floor = floor
-	if floor > S.Best then S.Best = floor end
-	if changed then notify() end
-end
-
 local function towerTick()
 	if not loadTowerModules() then
 		if not Tower.loaded then
@@ -911,8 +889,6 @@ local function towerTick()
 		end
 		return
 	end
-
-	pcall(trackFloor)
 
 	local mode = State.TowerMode
 	local section, key, detail
@@ -1025,196 +1001,31 @@ local function setAntiAfk(enabled)
 		return
 	end
 
-	AntiAfk.conn = player.Idled:Connect(function()
+	local lp = Players.LocalPlayer
+	if not lp then
+		warn("[AutumnDice] Anti AFK unavailable: LocalPlayer not ready")
+		State.Features.AntiAfk = false -- keep the toggle truthful
+		return
+	end
+
+	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
+		-- simulate a right-click hold to reset the internal idle timer
 		pcall(function()
-			VirtualUser:CaptureController()
-			VirtualUser:ClickButton2(Vector2.new())
+			local camera = workspace.CurrentCamera
+			local cf = camera and camera.CFrame or CFrame.new()
+			VirtualUser:Button2Down(Vector2.new(0, 0), cf)
+			task.wait(1)
+			VirtualUser:Button2Up(Vector2.new(0, 0), cf)
+			print("[AutumnDice] Anti-AFK triggered: prevented disconnect after " .. tostring(timeIdled) .. " seconds.")
 		end)
 	end)
 end
 
-----------------------------------------------------------------------
--- AUTO EXECUTE
--- Roblox kills the whole Lua VM on a rejoin, so the script is re-run through the
--- executor's queue_on_teleport. The queued loader only runs when the saved settings
--- file still says AutoExecute = true, which is how turning the toggle off cancels it
--- (a queued teleport script cannot be removed). Toggle states are saved to the
--- settings file and restored by the new instance.
-----------------------------------------------------------------------
 local HttpService = game:GetService("HttpService")
 local GuiService = game:GetService("GuiService")
 
-local AutoExec = { queued = false, saveScheduled = false, lastJson = nil, conns = {}, disconnected = false }
-
-local function getQueueFn()
-	return queue_on_teleport or queueonteleport
-		or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
-end
-
 local function hasFileApi()
 	return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
-end
-
--- Where to reload the script from: URL if set, otherwise a workspace file
--- (CONFIG.ScriptFile, falling back to "AutumnDice.lua" so an old/unedited config still works)
-local function resolveSource()
-	if CONFIG.ScriptUrl then
-		return "url", CONFIG.ScriptUrl
-	end
-	return "file", CONFIG.ScriptFile or "AutumnDice.lua"
-end
-
-local function buildLoader()
-	local kind, value = resolveSource()
-	local load
-	if kind == "url" then
-		load = ("loadstring(game:HttpGet(%q))()"):format(value)
-	else
-		load = ("loadstring(readfile(%q))()"):format(value)
-	end
-	return ([[
-local env = (getgenv and getgenv()) or _G
-if env.AutumnDice or env.AutumnDice_Booting then return end -- already running/starting: never start a second instance
-local okS, saved = pcall(function()
-	return game:GetService("HttpService"):JSONDecode(readfile(%q))
-end)
-if not (okS and type(saved) == "table" and type(saved.Features) == "table" and saved.Features.AutoExecute == true) then return end
-if not game:IsLoaded() then game.Loaded:Wait() end
-local Players = game:GetService("Players")
-while not Players.LocalPlayer do task.wait() end
-env.AutumnDice_Booting = true
-Players.LocalPlayer:WaitForChild("PlayerGui")
-task.wait(3)
-if env.AutumnDice then env.AutumnDice_Booting = nil return end
-env.AutumnDice_AutoExecBoot = true
-local okL, errL = pcall(function()
-	%s
-end)
-env.AutumnDice_Booting = nil
-if not okL then warn("[AutumnDice] Auto Execute failed to start: " .. tostring(errL)) end
-]]):format(CONFIG.SettingsFile, load)
-end
-
-local function queueAutoExecute()
-	if AutoExec.queued then return true end
-	local queue, loader = getQueueFn(), buildLoader()
-	if not queue or not loader then return false end
-	if pcall(queue, loader) then
-		AutoExec.queued = true
-		return true
-	end
-	return false
-end
-
-local function writeStub()
-	if type(makefolder) ~= "function" then return false end
-	local loader = buildLoader()
-	if not loader then return false end
-	pcall(makefolder, "Dice")
-	pcall(makefolder, "Dice/CustomLoadings")
-	return pcall(writefile, CONFIG.LoaderStub, loader)
-end
-
-local function removeStub()
-	if type(delfile) == "function" and type(isfile) == "function" and isfile(CONFIG.LoaderStub) then
-		pcall(delfile, CONFIG.LoaderStub)
-	end
-end
-
-local function snapshotSettings()
-	local features = {}
-	for name, value in pairs(State.Features) do features[name] = value end
-	local totals, order = {}, {}
-	for name, amount in pairs(State.Rewards.totals) do totals[name] = amount end
-	for i, name in ipairs(State.Rewards.order) do order[i] = name end
-	return {
-		Features = features,
-		TowerMode = State.TowerMode,
-		SelectedTower = State.SelectedTower,
-		Hotkey = State.Hotkey.Name,
-		Rewards = { totals = totals, order = order },
-	}
-end
-
-local function saveSettings(force)
-	if not hasFileApi() then return end
-	if not (State.Features.AutoExecute or force) then return end
-	local ok, json = pcall(function() return HttpService:JSONEncode(snapshotSettings()) end)
-	if not ok or json == AutoExec.lastJson then return end
-	if pcall(writefile, CONFIG.SettingsFile, json) then
-		AutoExec.lastJson = json
-	end
-end
-
--- keep the saved file current while Auto Execute is on (debounced, skips identical data)
-onChange(function()
-	if not State.Features.AutoExecute or AutoExec.saveScheduled then return end
-	AutoExec.saveScheduled = true
-	task.delay(1, function()
-		AutoExec.saveScheduled = false
-		saveSettings()
-	end)
-end)
-
-local function onDisconnected(reason)
-	if AutoExec.disconnected then return end
-	AutoExec.disconnected = true
-	saveSettings(true)      -- make sure the latest states are on disk
-	queueAutoExecute()      -- (re)arm in case the queue was lost
-	writeStub()
-	warn("[AutumnDice] Disconnected (" .. tostring(reason) .. "). Script will re-execute after you rejoin.")
-end
-
-local function startDisconnectWatch()
-	if #AutoExec.conns > 0 then return end
-	AutoExec.disconnected = false
-	table.insert(AutoExec.conns, GuiService.ErrorMessageChanged:Connect(function(msg)
-		if type(msg) == "string" and msg ~= "" then onDisconnected(msg) end
-	end))
-	pcall(function()
-		local overlay = game:GetService("CoreGui").RobloxPromptGui.promptOverlay
-		table.insert(AutoExec.conns, overlay.ChildAdded:Connect(function(child)
-			if child.Name == "ErrorPrompt" then onDisconnected("error prompt") end
-		end))
-	end)
-end
-
-local function stopDisconnectWatch()
-	for _, c in ipairs(AutoExec.conns) do pcall(function() c:Disconnect() end) end
-	AutoExec.conns = {}
-end
-
-local function setAutoExecute(enabled)
-	if not enabled then
-		stopDisconnectWatch()
-		removeStub()
-		saveSettings(true) -- file now says AutoExecute = false, so any queued loader exits
-		return
-	end
-
-	local problem
-	if not hasFileApi() then
-		problem = "readfile/writefile/isfile are not available in this executor"
-	elseif not getQueueFn() and type(makefolder) ~= "function" then
-		problem = "neither queue_on_teleport nor makefolder is available in this executor"
-	elseif select(1, resolveSource()) == "file" and not isfile(select(2, resolveSource())) then
-		problem = ('the script file "%s" was not found in the executor workspace. Save this script there under that name (or set CONFIG.ScriptUrl / CONFIG.ScriptFile)'):format(select(2, resolveSource()))
-	else
-		-- two independent routes; either one is enough (the loader's lock prevents a double start)
-		local queued = queueAutoExecute()
-		local stubbed = writeStub()
-		if not (queued or stubbed) then
-			problem = "could not queue or write the loader"
-		end
-	end
-	if problem then
-		warn("[AutumnDice] Auto Execute unavailable: " .. problem)
-		State.Features.AutoExecute = false -- keep the toggle truthful
-		return
-	end
-
-	saveSettings(true)
-	startDisconnectWatch()
 end
 
 ----------------------------------------------------------------------
@@ -1363,9 +1174,6 @@ local function SetFeature(name, value)
 	elseif name == "AntiAfk" then
 		setAntiAfk(value)
 		notify()
-	elseif name == "AutoExecute" then
-		setAutoExecute(value)
-		notify()
 	elseif name == "AutoReconnect" then
 		setAutoReconnect(value)
 		notify()
@@ -1379,84 +1187,103 @@ local function GetFeature(name)
 end
 
 ----------------------------------------------------------------------
--- TOWER REWARDS (hooks Towers.CompleteTowerFloor; an "ended" action carries the run's rewards)
+-- TOWER FLOOR TRACKING
+-- Read-only: watches the results of Towers.CompleteTowerFloor (the game calls it for every
+-- floor fight) to count Floors Cleared / Best Floor. The original results are returned untouched.
 ----------------------------------------------------------------------
-local Rewards = {
-	seen = setmetatable({}, { __mode = "k" }), -- result tables already counted (no double counting)
-	restore = {},
-}
+local FloorHook = { seen = setmetatable({}, { __mode = "k" }), restore = {} }
 
-local function recordRewards(result)
-	if typeof(result) ~= "table" or Rewards.seen[result] then return end
-
-	for _, action in ipairs(result) do
-		if type(action) == "table" and action.action == "ended" then
-			Rewards.seen[result] = true
-			local earned = action.rewards
-			if type(earned) == "table" then
-				local R = State.Rewards
-				for name, amount in pairs(earned) do
-					if type(amount) == "number" and amount > 0 then
-						local key = tostring(name)
-						if R.totals[key] == nil then
-							R.totals[key] = 0              -- new reward: create the entry once
-							table.insert(R.order, key)
-						end
-						R.totals[key] += amount            -- existing reward: add to its total
-					end
-				end
-			end
-			notify()
-			return
-		end
+local function describeAction(action)
+	local parts = {}
+	for k, v in pairs(action) do
+		table.insert(parts, tostring(k) .. "=" .. (type(v) == "table" and "{...}" or tostring(v)))
 	end
+	return table.concat(parts, ", ")
 end
 
--- Wraps a CallFunction so the original result is returned untouched
-local function wrapCall(original)
+local function onFloorResult(result)
+	if typeof(result) ~= "table" or FloorHook.seen[result] then return end
+	FloorHook.seen[result] = true
+
+	local ended, otherActions, explicitFloor = false, false, nil
+	for i, action in ipairs(result) do
+		if type(action) == "table" then
+			if CONFIG.DebugTowerFloors then
+				print(("[AutumnDice] CompleteTowerFloor action %d: %s"):format(i, describeAction(action)))
+			end
+			if action.action == "ended" then
+				ended = true
+			else
+				otherActions = true
+			end
+			local f = action.floor or action.currentFloor
+			if type(f) == "number" then explicitFloor = f end
+		end
+	end
+
+	local S = State.TowerStats
+	if S.RunEnded then -- the previous run is over: this call belongs to a new one
+		S.RunFloors = 0
+		S.RunEnded = false
+	end
+
+	-- a result that only says "ended" is the fight that was lost, so no floor was cleared
+	if explicitFloor or otherActions or not ended then
+		S.RunFloors += 1
+		S.Floors += 1
+		S.Floor = explicitFloor or S.RunFloors
+		S.Tracking = true
+		if S.Floor > S.Best then S.Best = S.Floor end
+	end
+	if ended then S.RunEnded = true end
+	notify()
+end
+
+local function wrapFloorCall(original)
 	return function(self, name, ...)
 		local packed = table.pack(original(self, name, ...))
 		if name == "CompleteTowerFloor" then
-			pcall(recordRewards, packed[1])
+			pcall(onFloorResult, packed[1])
 		end
 		return table.unpack(packed, 1, packed.n)
 	end
 end
 
-local function installRewardHook()
+local function installFloorHook()
 	local ok, err = pcall(function()
 		local Network = require(ReplicatedStorage.Packages.Network)
-
-		-- class level: catches the game's own Towers comm (skipped if the class has no CallFunction)
 		local cls = Network.ClientComm
+
+		-- class level: sees the game's own Towers comm (skipped if the class has no CallFunction)
 		local clsOriginal = type(cls) == "table" and rawget(cls, "CallFunction")
 		if type(clsOriginal) == "function" then
-			cls.CallFunction = wrapCall(clsOriginal)
-			table.insert(Rewards.restore, function() cls.CallFunction = clsOriginal end)
+			cls.CallFunction = wrapFloorCall(clsOriginal)
+			table.insert(FloorHook.restore, function() cls.CallFunction = clsOriginal end)
 		end
 
-		-- instance level (same pattern as the reference snippet)
-		local comm = cls.new(ReplicatedStorage.Network, "Towers")
+		-- instance level
+		local okComm, comm = pcall(function() return cls.new(ReplicatedStorage.Network, false, "Towers") end)
+		if not okComm then comm = cls.new(ReplicatedStorage.Network, "Towers") end
 		local instRaw = rawget(comm, "CallFunction")
 		local instOriginal = comm.CallFunction
 		if type(instOriginal) == "function" then
-			comm.CallFunction = wrapCall(instOriginal)
-			table.insert(Rewards.restore, function() comm.CallFunction = instRaw end)
+			comm.CallFunction = wrapFloorCall(instOriginal)
+			table.insert(FloorHook.restore, function() comm.CallFunction = instRaw end)
 		end
 	end)
 	if not ok then
-		warn("[AutumnDice] Reward hook failed: " .. tostring(err))
+		warn("[AutumnDice] Floor tracking unavailable: " .. tostring(err))
 	end
 end
 
-local function uninstallRewardHook()
-	for i = #Rewards.restore, 1, -1 do
-		pcall(Rewards.restore[i])
+local function uninstallFloorHook()
+	for i = #FloorHook.restore, 1, -1 do
+		pcall(FloorHook.restore[i])
 	end
-	Rewards.restore = {}
+	FloorHook.restore = {}
 end
 
-task.spawn(installRewardHook)
+task.spawn(installFloorHook)
 
 ----------------------------------------------------------------------
 -- GUI
@@ -1502,6 +1329,29 @@ local function formatNumber(n)
 	return r .. frac
 end
 
+-- V-shaped chevron drawn from two bars; Rotation = 180 turns it upside down
+local function makeChevron(parent, position, color)
+	local box = create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = position,
+		Size = UDim2.fromOffset(12, 12),
+		BackgroundTransparency = 1,
+		Parent = parent,
+	})
+	for _, spec in ipairs({ { 45, 3.75 }, { -45, 8.25 } }) do
+		create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromOffset(spec[2], 5.75),
+			Size = UDim2.fromOffset(7, 2),
+			Rotation = spec[1],
+			BackgroundColor3 = color,
+			BorderSizePixel = 0,
+			Parent = box,
+		}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+	end
+	return box
+end
+
 local THEME = {
 	bg = Color3.fromRGB(18, 19, 22),
 	card = Color3.fromRGB(26, 27, 31),
@@ -1539,13 +1389,11 @@ if not gui.Parent then gui.Parent = player:WaitForChild("PlayerGui") end
 local connections = {}
 local refreshers = {}
 
-local WIDTH = 300
-
 local main = create("Frame", {
 	Name = "Main",
-	Size = UDim2.fromOffset(WIDTH, 0),
-	AutomaticSize = Enum.AutomaticSize.Y,
-	Position = UDim2.new(0.5, -WIDTH / 2, 0.5, -230),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(380, 460), -- real size comes from applyLayout() (screen based)
 	BackgroundColor3 = THEME.bg,
 	BorderSizePixel = 0,
 	Parent = gui,
@@ -1553,7 +1401,6 @@ local main = create("Frame", {
 	corner(16),
 	stroke(THEME.stroke),
 	pad(8, 6, 8, 8),
-	vlist(6),
 })
 
 -- Title bar (drag handle) ---------------------------------------------------
@@ -1578,13 +1425,21 @@ local closeBtn = create("TextButton", {
 	Size = UDim2.fromOffset(20, 20),
 	Position = UDim2.new(1, -20, 0.5, -10),
 	BackgroundColor3 = THEME.field,
-	Text = "✕",
-	Font = Enum.Font.GothamBold,
-	TextSize = 10,
-	TextColor3 = THEME.subtext,
+	Text = "",
 	AutoButtonColor = true,
 	Parent = titleBar,
 }, { corner(8) })
+for _, rot in ipairs({ 45, -45 }) do
+	create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(10, 2),
+		Rotation = rot,
+		BackgroundColor3 = THEME.subtext,
+		BorderSizePixel = 0,
+		Parent = closeBtn,
+	}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
+end
 
 -- Dropdown popup infrastructure ---------------------------------------------
 local openDropdown = nil
@@ -1611,15 +1466,214 @@ catcher.MouseButton1Click:Connect(closeDropdowns)
 
 -- Building blocks -------------------------------------------------------------
 
--- Collapsible card: icon tile + title + chevron. Returns the body frame.
-local function makeCard(order, buildIcon, title, startCollapsed)
-	local card = create("Frame", {
+-- Layout: side navigation (left) + one page per tab (right) ----------------
+local SIDEBAR_GAP = 8
+
+-- fills the space between the title bar (top) and the footer (bottom)
+local bodyRow = create("Frame", {
+	Position = UDim2.fromOffset(0, 26),
+	Size = UDim2.new(1, 0, 1, -52),
+	BackgroundTransparency = 1,
+	Parent = main,
+})
+
+local sidebar = create("ScrollingFrame", {
+	Size = UDim2.new(0, 104, 1, 0),
+	BackgroundColor3 = THEME.card,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 0,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	Parent = bodyRow,
+}, { corner(10), stroke(THEME.stroke), pad(6, 6, 6, 6), vlist(4) })
+
+-- the tab pages live in here; it scrolls whenever a page is taller than the window
+local content = create("ScrollingFrame", {
+	Position = UDim2.fromOffset(104 + SIDEBAR_GAP, 0),
+	Size = UDim2.new(1, -(104 + SIDEBAR_GAP), 1, 0),
+	BackgroundTransparency = 1,
+	BorderSizePixel = 0,
+	ScrollBarThickness = 3,
+	ScrollBarImageColor3 = THEME.accent,
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	CanvasSize = UDim2.new(),
+	Parent = bodyRow,
+}, { pad(0, 0, 6, 0) })
+content:GetPropertyChangedSignal("CanvasPosition"):Connect(closeDropdowns)
+
+-- Two-column container: two equal columns side by side on wide windows, stacked on narrow ones.
+-- Equal widths come from 0.5 scale minus half the gap, so the columns stay even and aligned.
+local COLUMN_GAP = 10
+local twoColumnMode = false
+local columnSets = {}
+
+local function columnSize(two)
+	return two and UDim2.new(0.5, -COLUMN_GAP / 2, 0, 0) or UDim2.new(1, 0, 0, 0)
+end
+
+local function makeColumns(parent, order)
+	local layout = create("UIListLayout", {
+		FillDirection = twoColumnMode and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+		Padding = UDim.new(0, twoColumnMode and COLUMN_GAP or 8),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		VerticalAlignment = Enum.VerticalAlignment.Top,
+	})
+	local container = create("Frame", {
 		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Parent = parent,
+	}, { layout })
+
+	local function column(columnOrder)
+		return create("Frame", {
+			LayoutOrder = columnOrder,
+			Size = columnSize(twoColumnMode),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Parent = container,
+		}, { vlist(8) })
+	end
+
+	local set = { layout = layout, left = column(1), right = column(2) }
+	table.insert(columnSets, set)
+	return set
+end
+
+-- Two equal columns when the window is wide enough (a lone card keeps its half width);
+-- stacked into one column otherwise
+local function layoutColumnSet(set)
+	local two = twoColumnMode
+	set.layout.FillDirection = two and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
+	set.layout.Padding = UDim.new(0, two and COLUMN_GAP or 8)
+	set.left.Size = columnSize(two)
+	set.right.Size = columnSize(two)
+end
+
+local function refreshColumns()
+	for _, set in ipairs(columnSets) do layoutColumnSet(set) end
+end
+
+local function setColumnMode(two)
+	twoColumnMode = two
+	refreshColumns()
+end
+
+-- Responsive window: sized from the screen, never from the content
+local function applyLayout()
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+	local w = math.min(math.clamp(math.floor(vp.X * 0.5), 320, 640), vp.X - 16)
+	local h = math.min(math.clamp(math.floor(vp.Y * 0.75), 220, 580), vp.Y - 16)
+	local sideW = (w >= 340) and 104 or 88
+
+	-- two cards side by side only when each card would still be wide enough to read
+	local contentW = w - 16 - (sideW + SIDEBAR_GAP) - 6
+	setColumnMode(contentW >= 380)
+
+	main.Size = UDim2.fromOffset(w, h)
+	sidebar.Size = UDim2.new(0, sideW, 1, 0)
+	content.Position = UDim2.fromOffset(sideW + SIDEBAR_GAP, 0)
+	content.Size = UDim2.new(1, -(sideW + SIDEBAR_GAP), 1, 0)
+	closeDropdowns()
+
+	-- if the new size pushed the window off screen, put it back in the middle
+	task.delay(0.1, function()
+		if not main.Parent then return end
+		local pos, size = main.AbsolutePosition, main.AbsoluteSize
+		if pos.X < 0 or pos.Y < 0 or pos.X + size.X > vp.X or pos.Y + size.Y > vp.Y then
+			main.Position = UDim2.fromScale(0.5, 0.5)
+		end
+	end)
+end
+applyLayout()
+
+local cameraConn
+local function watchCamera()
+	if cameraConn then cameraConn:Disconnect() cameraConn = nil end
+	local cam = workspace.CurrentCamera
+	if cam then
+		cameraConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(applyLayout)
+		table.insert(connections, cameraConn)
+	end
+end
+watchCamera()
+table.insert(connections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	watchCamera()
+	applyLayout()
+end))
+
+local tabs = {}
+
+local function selectTab(name)
+	closeDropdowns()
+	content.CanvasPosition = Vector2.new(0, 0)
+	for tabName, tab in pairs(tabs) do
+		local on = (tabName == name)
+		tab.page.Visible = on
+		tab.bar.Visible = on
+		tab.button.BackgroundTransparency = on and 0 or 1
+		tab.label.TextColor3 = on and THEME.accent or THEME.body
+	end
+end
+
+-- Adds a nav button + a page. Returns its two columns ({ left, right }) to put cards in.
+local function addTab(order, name)
+	local button = create("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 28),
+		BackgroundColor3 = THEME.accentDim,
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = sidebar,
+	}, { corner(8) })
+	local bar = create("Frame", {
+		Size = UDim2.fromOffset(3, 14),
+		Position = UDim2.new(0, 0, 0.5, -7),
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+		Visible = false,
+		Parent = button,
+	}, { pill() })
+	local label = create("TextLabel", {
+		Size = UDim2.new(1, -14, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1,
+		Text = name,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 11,
+		TextColor3 = THEME.body,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = button,
+	})
+	local page = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Visible = false,
+		Parent = content,
+	}, { vlist(8) })
+
+	tabs[name] = { button = button, label = label, bar = bar, page = page }
+	button.MouseButton1Click:Connect(function() selectTab(name) end)
+	-- the page is a 2-column grid: build cards in .left and .right (they stack on narrow windows)
+	return makeColumns(page, 1)
+end
+
+-- Collapsible card shown on a tab page: icon tile + title + chevron, then the body. Returns the body frame.
+local function makeCard(parent, buildIcon, title, order)
+	local card = create("Frame", {
+		LayoutOrder = order or 1,
 		Size = UDim2.new(1, 0, 0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundColor3 = THEME.card,
 		BorderSizePixel = 0,
-		Parent = main,
+		Parent = parent,
 	}, {
 		corner(10),
 		stroke(THEME.stroke),
@@ -1653,16 +1707,7 @@ local function makeCard(order, buildIcon, title, startCollapsed)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = header,
 	})
-	local chevron = create("TextLabel", {
-		Size = UDim2.new(0, 20, 1, 0),
-		Position = UDim2.new(1, -20, 0, 0),
-		BackgroundTransparency = 1,
-		Text = "▾",
-		Font = Enum.Font.GothamBold,
-		TextSize = 11,
-		TextColor3 = THEME.subtext,
-		Parent = header,
-	})
+	local chevron = makeChevron(header, UDim2.new(1, -10, 0.5, 0), THEME.subtext)
 
 	local body = create("Frame", {
 		LayoutOrder = 2,
@@ -1672,11 +1717,7 @@ local function makeCard(order, buildIcon, title, startCollapsed)
 		Parent = card,
 	}, { vlist(8) })
 
-	if startCollapsed then
-		body.Visible = false
-		chevron.Rotation = 180
-	end
-
+	-- collapse / expand
 	header.MouseButton1Click:Connect(function()
 		closeDropdowns()
 		body.Visible = not body.Visible
@@ -1721,6 +1762,7 @@ local function makeToggle(parent, order, labelText, featureName)
 		Font = Enum.Font.GothamMedium,
 		TextSize = 13,
 		TextColor3 = THEME.text,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = row,
 	})
@@ -1797,16 +1839,7 @@ local function makeDropdown(parent, order, labelText, onSelect)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = btn,
 	})
-	create("TextLabel", {
-		Size = UDim2.fromOffset(16, 30),
-		Position = UDim2.new(1, -22, 0, 0),
-		BackgroundTransparency = 1,
-		Text = "▾",
-		Font = Enum.Font.GothamBold,
-		TextSize = 11,
-		TextColor3 = THEME.body,
-		Parent = btn,
-	})
+	makeChevron(btn, UDim2.new(1, -14, 0.5, 0), THEME.body)
 
 	-- popup lives directly under the ScreenGui so the card layouts never move it
 	local list = create("ScrollingFrame", {
@@ -1906,9 +1939,9 @@ local function makeDropdown(parent, order, labelText, onSelect)
 end
 
 ----------------------------------------------------------------------
--- Card: Auto Roll
+-- Tab: Auto Roll
 ----------------------------------------------------------------------
-local rollBody = makeCard(2, function(tile)
+local rollBody = makeCard(addTab(1, "Auto Roll").left, function(tile)
 	create("TextLabel", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -1932,9 +1965,10 @@ local rollInfo = create("Frame", {
 local rollCount = makeLine(rollInfo, 1, 12, THEME.subtext)
 
 ----------------------------------------------------------------------
--- Card: Auto Tower
+-- Tab: Auto Tower
 ----------------------------------------------------------------------
-local towerBody = makeCard(3, function(tile)
+local towerTab = addTab(2, "Auto Tower")
+local towerBody = makeCard(towerTab.left, function(tile)
 	-- crossed swords, drawn with two rotated bars so no font/emoji is needed
 	for _, rot in ipairs({ 45, -45 }) do
 		create("Frame", {
@@ -1947,7 +1981,7 @@ local towerBody = makeCard(3, function(tile)
 			Parent = tile,
 		}, { pill() })
 	end
-end, "Auto Tower", true)
+end, "Auto Tower")
 
 local modeDropdown = makeDropdown(towerBody, 1, "Mode", function(choice)
 	SetTowerMode(choice)
@@ -1962,6 +1996,7 @@ towerDropdown.SetOptions({})
 makeToggle(towerBody, 3, "Auto Equip Best Team", "AutoEquipBest")
 makeToggle(towerBody, 4, "Auto Tower", "AutoTower")
 
+
 local towerInfo = create("Frame", {
 	LayoutOrder = 5,
 	Size = UDim2.new(1, 0, 0, 0),
@@ -1974,26 +2009,22 @@ local towerLine = makeLine(towerInfo, 1, 12, THEME.body, Enum.Font.GothamMedium)
 
 local statsRow = create("Frame", {
 	LayoutOrder = 2,
-	Size = UDim2.new(1, 0, 0, 16),
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
 	BackgroundTransparency = 1,
 	Parent = towerInfo,
-}, {
-	create("UIListLayout", {
-		FillDirection = Enum.FillDirection.Horizontal,
-		Padding = UDim.new(0, 12),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-	}),
-})
+}, { vlist(2) })
 local function statLabel(order)
 	return create("TextLabel", {
 		LayoutOrder = order,
-		Size = UDim2.fromOffset(0, 16),
-		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.new(1, 0, 0, 16),
 		BackgroundTransparency = 1,
 		Text = "",
 		Font = Enum.Font.Gotham,
 		TextSize = 11,
 		TextColor3 = THEME.subtext,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
 		Parent = statsRow,
 	})
 end
@@ -2001,46 +2032,10 @@ local runsLabel = statLabel(1)
 local floorsLabel = statLabel(2)
 local bestLabel = statLabel(3)
 
-local rewardsHeader = makeLine(towerInfo, 3, 12, THEME.body, Enum.Font.GothamMedium)
-rewardsHeader.Text = "Tower Rewards"
-local rewardsList = create("ScrollingFrame", {
-	LayoutOrder = 4,
-	Size = UDim2.new(1, 0, 0, 26),
-	BackgroundColor3 = THEME.field,
-	BorderSizePixel = 0,
-	ScrollBarThickness = 3,
-	ScrollBarImageColor3 = THEME.accent,
-	AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	CanvasSize = UDim2.new(),
-	Parent = towerInfo,
-}, { corner(6), pad(8, 4, 8, 4), vlist(1) })
-local rewardsEmpty = create("TextLabel", {
-	LayoutOrder = 0,
-	Size = UDim2.new(1, 0, 0, 18),
-	BackgroundTransparency = 1,
-	Text = "No rewards yet",
-	Font = Enum.Font.Gotham,
-	TextSize = 12,
-	TextColor3 = THEME.subtext,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = rewardsList,
-})
-local rewardRows = {}
-
-create("Frame", {
-	LayoutOrder = 5,
-	Size = UDim2.new(1, 0, 0, 1),
-	BackgroundColor3 = THEME.stroke,
-	BorderSizePixel = 0,
-	Parent = towerInfo,
-})
-local towerStatus = makeLine(towerInfo, 6, 12, THEME.subtext, Enum.Font.GothamBold)
-local towerDetail = makeLine(towerInfo, 7, 11, THEME.subtext)
-
 ----------------------------------------------------------------------
--- Card: Miscellaneous (GUI only - toggles just flip their State.Features flag for now)
+-- Tab: Miscellaneous
 ----------------------------------------------------------------------
-local miscBody = makeCard(4, function(tile)
+local miscBody = makeCard(addTab(3, "Miscellaneous").left, function(tile)
 	-- settings icon: three stacked bars
 	for i, w in ipairs({ 14, 9, 12 }) do
 		create("Frame", {
@@ -2052,17 +2047,275 @@ local miscBody = makeCard(4, function(tile)
 			Parent = tile,
 		}, { pill() })
 	end
-end, "Miscellaneous", true)
+end, "Miscellaneous")
 
 makeToggle(miscBody, 1, "Anti AFK", "AntiAfk")
 makeToggle(miscBody, 2, "Auto Reconnect", "AutoReconnect")
-makeToggle(miscBody, 3, "Auto Execute", "AutoExecute")
+
+----------------------------------------------------------------------
+-- Tab: Event -> Quest card (local player's Autumn quests, Daily + Hourly)
+-- Data comes from DataController[period.dataKey]() and AutumnQuestConfig, the same way the
+-- reference script reads them; the card re-renders whenever that data changes.
+----------------------------------------------------------------------
+local function questIcon(tile)
+	-- "!" icon
+	create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, -3),
+		Size = UDim2.fromOffset(3, 10),
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+		Parent = tile,
+	}, { pill() })
+	create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 7),
+		Size = UDim2.fromOffset(3, 3),
+		BackgroundColor3 = THEME.accent,
+		BorderSizePixel = 0,
+		Parent = tile,
+	}, { pill() })
+end
+
+local eventTab = addTab(4, "Event")
+local questBody = makeCard(eventTab.left, questIcon, "Quest")
+
+local Quests = { loaded = false, hooked = false, hooks = {}, signature = nil }
+
+local QUEST_STATUS = {
+	progress = { text = "In Progress", color = THEME.accent },
+	complete = { text = "Complete", color = Color3.fromRGB(88, 204, 128) },
+	claimed = { text = "Claimed", color = THEME.subtext },
+}
+
+local function loadQuestModules()
+	if Quests.loaded then return true end
+	local ok = pcall(function()
+		local features = ReplicatedStorage.Framework.Features
+		Quests.DataController = require(features.Data.DataController)
+		Quests.Config = require(features.Autumn.AutumnQuestConfig)
+	end)
+	if not ok or not Quests.DataController or not Quests.Config then
+		Quests.DataController, Quests.Config = nil, nil
+		return false
+	end
+	Quests.loaded = true
+	return true
+end
+
+-- Snapshot of every quest period, with progress clamped to 0..target
+local function readQuestSections()
+	if not Quests.loaded then
+		return { { title = "Quests", quests = {}, message = "Waiting for the game's quest data..." } }
+	end
+
+	local sections = {}
+	pcall(function()
+		for _, period in Quests.Config.Periods do
+			local title = tostring(period.title or period.dataKey)
+			local section = { title = title, quests = {}, bonusClaimed = false }
+
+			local okState, state = pcall(function() return Quests.DataController[period.dataKey]() end)
+			if okState and type(state) == "table" and type(state.quests) == "table" and #state.quests > 0 then
+				local progressMap = type(state.progress) == "table" and state.progress or {}
+				local claimedMap = type(state.claimed) == "table" and state.claimed or {}
+
+				for _, questId in ipairs(state.quests) do
+					local okQ, quest = pcall(Quests.Config.GetQuest, questId)
+					if okQ and type(quest) == "table" then
+						local target = type(quest.target) == "number" and math.max(quest.target, 0) or 0
+						local progress = progressMap[questId]
+						progress = type(progress) == "number" and math.clamp(progress, 0, target) or 0
+						local claimed = claimedMap[questId] == true
+						table.insert(section.quests, {
+							id = tostring(quest.id or questId),
+							title = tostring(quest.title or questId),
+							progress = progress,
+							target = target,
+							status = claimed and "claimed" or (progress >= target and "complete" or "progress"),
+						})
+					end
+				end
+				section.bonusClaimed = state.bonusClaimed == true
+			end
+
+			if #section.quests == 0 then
+				section.message = "No " .. title .. " quests yet (still syncing or none rolled)"
+			end
+			table.insert(sections, section)
+		end
+	end)
+
+	if #sections == 0 then
+		sections = { { title = "Quests", quests = {}, message = "No quest periods found." } }
+	end
+	return sections
+end
+
+local function questSignature(sections)
+	local parts = {}
+	for _, sec in ipairs(sections) do
+		table.insert(parts, ("%s|%s|%s"):format(sec.title, sec.message or "", tostring(sec.bonusClaimed)))
+		for _, q in ipairs(sec.quests) do
+			table.insert(parts, ("%s:%s:%s:%s:%s"):format(q.id, q.title, tostring(q.progress), tostring(q.target), q.status))
+		end
+	end
+	return table.concat(parts, "\n")
+end
+
+local function buildQuestRow(parent, order, q)
+	local info = QUEST_STATUS[q.status]
+	local row = create("Frame", {
+		LayoutOrder = order,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = THEME.field,
+		BorderSizePixel = 0,
+		Parent = parent,
+	}, { corner(6), pad(8, 6, 8, 6), vlist(4) })
+
+	-- status column: progress while in progress, CLAIMED once claimed
+	local statusText = info.text
+	if q.status == "progress" then
+		statusText = formatNumber(q.progress) .. "/" .. formatNumber(q.target)
+	elseif q.status == "claimed" then
+		statusText = "CLAIMED"
+	end
+
+	local top = create("Frame", {
+		LayoutOrder = 1,
+		Size = UDim2.new(1, 0, 0, 16),
+		BackgroundTransparency = 1,
+		Parent = row,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, -72, 1, 0),
+		BackgroundTransparency = 1,
+		Text = q.title,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextColor3 = THEME.text,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = top,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(0, 70, 1, 0),
+		Position = UDim2.new(1, -70, 0, 0),
+		BackgroundTransparency = 1,
+		Text = statusText,
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		TextColor3 = info.color,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = top,
+	})
+
+	local track = create("Frame", {
+		LayoutOrder = 2,
+		Size = UDim2.new(1, 0, 0, 4),
+		BackgroundColor3 = THEME.bg,
+		BorderSizePixel = 0,
+		Parent = row,
+	}, { pill() })
+	local ratio = q.target > 0 and (q.progress / q.target) or 1
+	create("Frame", {
+		Size = UDim2.fromScale(math.clamp(ratio, 0, 1), 1),
+		BackgroundColor3 = info.color,
+		BorderSizePixel = 0,
+		Parent = track,
+	}, { pill() })
+end
+
+-- Rebuilds the card only when the data actually changed
+local function renderQuests()
+	local sections = readQuestSections()
+	local signature = questSignature(sections)
+	if signature == Quests.signature then return end
+	Quests.signature = signature
+
+	for _, child in ipairs(questBody:GetChildren()) do
+		if child:IsA("GuiObject") then child:Destroy() end
+	end
+
+	for i, sec in ipairs(sections) do
+		local block = create("Frame", {
+			LayoutOrder = i,
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Parent = questBody,
+		}, { vlist(4) })
+
+		makeLine(block, 1, 12, THEME.text, Enum.Font.GothamBold).Text = sec.title
+		if sec.message then
+			makeLine(block, 2, 11, THEME.subtext).Text = sec.message
+		end
+		for j, q in ipairs(sec.quests) do
+			buildQuestRow(block, 10 + j, q)
+		end
+		if #sec.quests > 0 then
+			makeLine(block, 100, 11, THEME.subtext).Text = "Bonus claimed: " .. (sec.bonusClaimed and "Yes" or "No")
+		end
+	end
+end
+
+local questRenderScheduled = false
+local function scheduleQuestRender()
+	if questRenderScheduled then return end
+	questRenderScheduled = true
+	task.defer(function()
+		questRenderScheduled = false
+		pcall(renderQuests)
+	end)
+end
+
+-- Re-render on any Daily/Hourly change: progress, claims, newly rolled quests
+local function hookQuestChanges()
+	if Quests.hooked or not Quests.loaded then return end
+	Quests.hooked = true
+	pcall(function()
+		for _, period in Quests.Config.Periods do
+			local ok, conn = pcall(function()
+				return Quests.DataController[period.dataKey].Changed(scheduleQuestRender)
+			end)
+			if ok and conn ~= nil then table.insert(Quests.hooks, conn) end
+		end
+	end)
+end
+
+local function unhookQuests()
+	for _, conn in ipairs(Quests.hooks) do
+		pcall(function()
+			if typeof(conn) == "RBXScriptConnection" then
+				conn:Disconnect()
+			elseif type(conn) == "table" and type(conn.Disconnect) == "function" then
+				conn:Disconnect()
+			elseif type(conn) == "function" then
+				conn()
+			end
+		end)
+	end
+	Quests.hooks = {}
+end
+
+-- Loads the game modules once they exist, then keeps a slow safety-net refresh
+task.spawn(function()
+	while gui.Parent do
+		if loadQuestModules() then hookQuestChanges() end
+		pcall(renderQuests)
+		task.wait(3)
+	end
+end)
+
+refreshColumns()
+selectTab("Auto Roll")
 
 ----------------------------------------------------------------------
 -- Footer: hotkey
 ----------------------------------------------------------------------
 local hotkeyRow = create("Frame", {
-	LayoutOrder = 5,
+	Position = UDim2.new(0, 0, 1, -22),
 	Size = UDim2.new(1, 0, 0, 22),
 	BackgroundTransparency = 1,
 	Parent = main,
@@ -2190,35 +2443,6 @@ local function refreshGui()
 	floorsLabel.Text = (S.Tracking and tostring(S.Floors) or "-") .. " Floors Cleared"
 	bestLabel.Text = "Best Floor " .. ((S.Tracking and S.Best > 0) and tostring(S.Best) or "-")
 
-	-- Rewards: one row per reward, text updated in place (never duplicated or overwritten)
-	local R = State.Rewards
-	local count = #R.order
-	rewardsEmpty.Visible = (count == 0)
-	for i, name in ipairs(R.order) do
-		local row = rewardRows[name]
-		if not row then
-			row = create("TextLabel", {
-				LayoutOrder = i,
-				Size = UDim2.new(1, 0, 0, 18),
-				BackgroundTransparency = 1,
-				Text = "",
-				Font = Enum.Font.GothamMedium,
-				TextSize = 12,
-				TextColor3 = THEME.body,
-				TextXAlignment = Enum.TextXAlignment.Left,
-				Parent = rewardsList,
-			})
-			rewardRows[name] = row
-		end
-		row.Text = formatNumber(R.totals[name]) .. " " .. name
-	end
-	rewardsList.Size = UDim2.new(1, 0, 0, math.clamp(math.max(count, 1) * 19 + 8, 26, 130))
-
-	local tinfo = TOWER_STATUS[State.TowerStatus] or TOWER_STATUS.Off
-	towerStatus.Text = tinfo.text
-	towerStatus.TextColor3 = tinfo.color
-	towerDetail.Text = State.TowerDetail
-
 	modeDropdown.SetValue(State.TowerMode)
 	towerDropdown.SetValue(State.SelectedTower)
 	towerDropdown.SetDimmed(State.TowerMode ~= "Single") -- the Tower pick only applies in Single mode
@@ -2243,10 +2467,10 @@ end)
 ----------------------------------------------------------------------
 local function Unload()
 	syncAlive = false
-	uninstallRewardHook()
 	setAntiAfk(false)
 	setAutoReconnect(false)
-	stopDisconnectWatch()
+	uninstallFloorHook()
+	unhookQuests()
 	State.Features.AutoDice = false
 	State.Features.AutoTower = false
 	runId += 1
@@ -2256,14 +2480,7 @@ local function Unload()
 	env.AutumnDice = nil
 end
 
--- closing the GUI with X is a deliberate stop: also cancel the Auto Execute on rejoin
-closeBtn.MouseButton1Click:Connect(function()
-	if State.Features.AutoExecute then
-		State.Features.AutoExecute = false
-		setAutoExecute(false)
-	end
-	Unload()
-end)
+closeBtn.MouseButton1Click:Connect(Unload)
 
 env.AutumnDice = {
 	SetFeature = SetFeature,
@@ -2273,68 +2490,13 @@ env.AutumnDice = {
 	GetStatus = function() return State.Status, State.Detail end,
 	GetTowerStatus = function() return State.TowerStatus, State.TowerDetail end,
 	SetHotkey = function(keyCode) State.Hotkey = keyCode notify() end,
-	GetRewards = function()
-		local copy = {}
-		for name, amount in pairs(State.Rewards.totals) do copy[name] = amount end
-		return copy
-	end,
 	Unload = Unload,
 }
 
 ----------------------------------------------------------------------
--- Defaults: these four (Anti AFK, Auto Reconnect, Auto Execute, Auto Roll) start ON on a normal (manual) launch. SetFeature starts the real
--- behavior, and the toggles follow State. After an Auto Execute relaunch the saved
--- states are restored instead (below), so a feature the user turned off stays off.
+-- Defaults: Anti AFK, Auto Reconnect and Auto Roll start ON. SetFeature starts the real
+-- behavior, and the toggles follow State.
 ----------------------------------------------------------------------
-if not env.AutumnDice_AutoExecBoot then
-	for _, name in ipairs({ "AntiAfk", "AutoReconnect", "AutoExecute", "AutoDice" }) do
-		SetFeature(name, true)
-	end
-end
-
-----------------------------------------------------------------------
--- Restore after an Auto Execute relaunch
-----------------------------------------------------------------------
-if env.AutumnDice_AutoExecBoot then
-	env.AutumnDice_AutoExecBoot = nil
-	task.spawn(function()
-		if not hasFileApi() or not isfile(CONFIG.SettingsFile) then return end
-		local ok, saved = pcall(function() return HttpService:JSONDecode(readfile(CONFIG.SettingsFile)) end)
-		if not ok or type(saved) ~= "table" or type(saved.Features) ~= "table" then return end
-		local f = saved.Features
-
-		-- session rewards carry over the reconnect
-		local R = saved.Rewards
-		if type(R) == "table" and type(R.totals) == "table" and type(R.order) == "table" then
-			for _, name in ipairs(R.order) do
-				local amount = R.totals[name]
-				if type(name) == "string" and type(amount) == "number" and State.Rewards.totals[name] == nil then
-					State.Rewards.totals[name] = amount
-					table.insert(State.Rewards.order, name)
-				end
-			end
-		end
-
-		if type(saved.Hotkey) == "string" then
-			local okKey, key = pcall(function() return Enum.KeyCode[saved.Hotkey] end)
-			if okKey and key then State.Hotkey = key end
-		end
-		if type(saved.TowerMode) == "string" then SetTowerMode(saved.TowerMode) end
-		notify()
-
-		-- features that don't depend on the game's tower data
-		for _, name in ipairs({ "AutoExecute", "AntiAfk", "AutoReconnect", "AutoEquipBest", "AutoDice" }) do
-			if f[name] == true then SetFeature(name, true) end
-		end
-
-		-- tower selection needs the tower list to be loaded first (wait up to ~30s)
-		if type(saved.SelectedTower) == "string" then
-			for _ = 1, 60 do
-				if table.find(Tower.names, saved.SelectedTower) then break end
-				task.wait(0.5)
-			end
-			SetSelectedTower(saved.SelectedTower)
-		end
-		if f.AutoTower == true then SetFeature("AutoTower", true) end
-	end)
+for _, name in ipairs({ "AntiAfk", "AutoReconnect", "AutoDice" }) do
+	SetFeature(name, true)
 end
