@@ -47,8 +47,7 @@ end
 -- Config
 ----------------------------------------------------------------------
 local CONFIG = {
-	DiceLocation = Vector3.new(-3065.865234375, 224.5791015625, 5659.744140625),
-	DefaultHotkey = Enum.KeyCode.LeftControl,
+		DefaultHotkey = Enum.KeyCode.LeftControl,
 
 	-- Auto Roll
 	RollAmount = 5,           -- argument passed to LeafDiceService.RF.Roll
@@ -62,7 +61,6 @@ local CONFIG = {
 	TeleportSettle = 2,
 
 	ArriveDistance = 8,
-	MoveAttempts = 5,
 
 	-- Auto Tower
 	TowerRestartCooldown = 3, -- minimum seconds between tower start attempts
@@ -80,10 +78,6 @@ local CONFIG = {
 	-- It must return true (run active) or false (no run). Leave nil to use auto-detection.
 	--   IsRunActive = function() return SomeController.inRun() end,
 	IsRunActive = nil,
-
-	-- Floors Cleared / Best Floor come from the game's own Towers.CompleteTowerFloor results.
-	-- Set to true to print every result's actions in the console (to check the numbers).
-	DebugTowerFloors = false,
 
 	-- Auto Reconnect
 	ReconnectFile = "AutumnDice_Server.json", -- remembers the server (PlaceId/JobId) to rejoin
@@ -103,7 +97,7 @@ local State = {
 	Features = {
 		AutoDice = false, AutoTower = false, AutoEquipBest = false,
 		-- Miscellaneous
-		AntiAfk = false, AutoReconnect = false,
+		AntiAfk = false, AutoReconnect = false, AutoClaimQuest = false,
 	},
 	Status = "Idle",
 	Detail = "Enable \"Auto Roll Autumn Dice\" to start.",
@@ -116,13 +110,12 @@ local State = {
 	TowerDetail = "Auto Tower is disabled.",
 
 	TowerStats = {
-		Runs = 0,          -- successful tower starts made by Auto Tower
+		Runs = 0,          -- tower runs started (any start, via TowerController.startTower)
 		Floors = 0,        -- floors cleared since the script started
-		Best = 0,          -- best floor seen
-		Floor = nil,       -- floors cleared in the current run (nil = no data yet)
-		Tracking = false,  -- true once the game has reported a floor
-		RunFloors = 0,     -- internal: floors cleared in the current run
-		RunEnded = false,  -- internal: the last run ended, the next floor starts a new one
+		Best = 0,          -- highest floor seen
+		Floor = nil,       -- current floor of the run (nil = no data yet)
+		LastFloor = nil,   -- internal: previous floor shown by the game's Floor label
+		Tracking = false,  -- true once the Floor label has been read
 	},
 }
 
@@ -262,6 +255,143 @@ local function getHRP(timeout)
 	return nil
 end
 
+local AutumnTravel = { travelRemote = nil, traveling = false, movementOwner = nil, questRequested = false }
+
+local function canContinue(shouldContinue)
+	return not shouldContinue or shouldContinue()
+end
+
+function AutumnTravel.acquire(owner, shouldContinue)
+	local deadline = os.clock() + 90
+	while ((AutumnTravel.movementOwner and AutumnTravel.movementOwner ~= owner) or (AutumnTravel.rollRemote and inFlight[AutumnTravel.rollRemote])) and canContinue(shouldContinue) and os.clock() < deadline do
+		task.wait(0.1)
+	end
+	if not canContinue(shouldContinue) or os.clock() >= deadline then return false end
+	AutumnTravel.movementOwner = owner
+	return true
+end
+
+function AutumnTravel.release(owner)
+	if AutumnTravel.movementOwner == owner then AutumnTravel.movementOwner = nil end
+end
+function AutumnTravel.findZone(zoneName)
+	if type(zoneName) ~= "string" or zoneName == "" then return nil end
+	local zones = workspace:FindFirstChild("Zones")
+	local zone = zones and zones:FindFirstChild(zoneName)
+	return zone and (zone:IsA("BasePart") or zone:IsA("Model")) and zone or nil
+end
+
+function AutumnTravel.isInAutumnWorld()
+	local zone = AutumnTravel.findZone("AutumnWorld")
+	local root = getHRP()
+	if not zone or not root then return false end
+	local frame, size
+	if zone:IsA("Model") then
+		frame, size = zone:GetBoundingBox()
+	else
+		frame, size = zone.CFrame, zone.Size
+	end
+	local position = frame:PointToObjectSpace(root.Position)
+	local half = size / 2
+	return math.abs(position.X) <= half.X and math.abs(position.Y) <= half.Y and math.abs(position.Z) <= half.Z
+end
+
+function AutumnTravel.ensureInAutumnWorld(shouldContinue)
+	local characterDeadline = os.clock() + 15
+	while canContinue(shouldContinue) and not getHRP() and os.clock() < characterDeadline do
+		task.wait(0.2)
+	end
+	if not canContinue(shouldContinue) then return false, "Cancelled." end
+	if not getHRP() then return false, "Character not found." end
+	if AutumnTravel.isInAutumnWorld() then return true end
+
+	local waitDeadline = os.clock() + CONFIG.InvokeTimeout * 2
+	while AutumnTravel.traveling and canContinue(shouldContinue) and os.clock() < waitDeadline do
+		if AutumnTravel.isInAutumnWorld() then return true end
+		task.wait(0.1)
+	end
+	if not canContinue(shouldContinue) then return false, "Cancelled." end
+	if AutumnTravel.isInAutumnWorld() then return true end
+	if AutumnTravel.traveling then return false, "Travel is still in progress." end
+
+	AutumnTravel.traveling = true
+	local function finish(success, reason)
+		AutumnTravel.traveling = false
+		return success, reason
+	end
+
+	local found, remote = pcall(function()
+		return AutumnTravel.travelRemote or getRemote({ "Network", "AutumnService", "RF", "Travel" }, CONFIG.RemoteWaitTimeout)
+	end)
+	if not found or not remote then return finish(false, "Travel remote not found.") end
+	AutumnTravel.travelRemote = remote
+
+	local called, ok, result = pcall(invoke, remote, "Autumn")
+	if not called then return finish(false, tostring(ok)) end
+	if not canContinue(shouldContinue) then return finish(false, "Cancelled.") end
+	if not ok or result == false then return finish(false, "Travel failed: " .. tostring(result)) end
+
+	local deadline = os.clock() + 15
+	while canContinue(shouldContinue) and not AutumnTravel.isInAutumnWorld() and os.clock() < deadline do
+		task.wait(0.25)
+	end
+	if not canContinue(shouldContinue) then return finish(false, "Cancelled.") end
+	if not AutumnTravel.isInAutumnWorld() then return finish(false, "Timed out waiting for Autumn World.") end
+	return finish(true)
+end
+local function stopWalking(humanoid)
+	if not humanoid then return end
+	pcall(function()
+		local root = humanoid.RootPart
+		if root then humanoid:MoveTo(root.Position) end
+		humanoid:Move(Vector3.zero)
+	end)
+end
+function AutumnTravel.walkToZone(zoneName, shouldContinue)
+	local zone = AutumnTravel.findZone(zoneName)
+	if not zone then return false, "Zone not found: " .. tostring(zoneName) end
+
+	local characterDeadline = os.clock() + 15
+	while canContinue(shouldContinue) and not getHRP() and os.clock() < characterDeadline do
+		task.wait(0.2)
+	end
+	if not canContinue(shouldContinue) then return false, "Cancelled." end
+	if not getHRP() then return false, "Character not found." end
+
+	local deadline = os.clock() + 30
+	local movingHumanoid, nextMove = nil, 0
+	while canContinue(shouldContinue) and os.clock() < deadline do
+		zone = AutumnTravel.findZone(zoneName)
+		if not zone then
+			stopWalking(movingHumanoid)
+			return false, "Zone not found: " .. tostring(zoneName)
+		end
+
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if humanoid and root and humanoid.Health > 0 then
+			if (root.Position - zone:GetPivot().Position).Magnitude <= CONFIG.ArriveDistance then
+				stopWalking(humanoid)
+				return true
+			end
+			if humanoid ~= movingHumanoid or os.clock() >= nextMove then
+				local moved = pcall(function() humanoid:MoveTo(zone:GetPivot().Position) end)
+				if not moved then
+					stopWalking(humanoid)
+					return false, "Could not move to zone: " .. tostring(zoneName)
+				end
+				movingHumanoid = humanoid
+				nextMove = os.clock() + 5
+			end
+		end
+		task.wait(0.25)
+	end
+
+	stopWalking(movingHumanoid)
+	if not canContinue(shouldContinue) then return false, "Cancelled." end
+	return false, "Timed out walking to zone: " .. tostring(zoneName)
+end
 ----------------------------------------------------------------------
 -- AUTO ROLL
 ----------------------------------------------------------------------
@@ -291,36 +421,9 @@ local function failAndStop(id, message)
 	return false
 end
 
-local function moveTo(id, target)
-	local hrp = getHRP(15)
-	if not hrp then return false, "Character not found." end
-
-	for _ = 1, CONFIG.MoveAttempts do
-		if not alive(id) then return false, "Cancelled." end
-		hrp = getHRP(5)
-		local char = player.Character
-		if not hrp or not char then return false, "Character lost while moving." end
-		if (hrp.Position - target).Magnitude <= CONFIG.ArriveDistance then break end
-
-		char:PivotTo(CFrame.new(target))
-		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.AssemblyAngularVelocity = Vector3.zero
-		task.wait(0.4)
-	end
-
-	hrp = getHRP(5)
-	if not hrp then return false, "Character lost while moving." end
-	local finalDist = (hrp.Position - target).Magnitude
-	if finalDist > CONFIG.ArriveDistance + 5 then
-		return false, ("Could not reach the dice location (%.0f studs away)."):format(finalDist)
-	end
-	return true
-end
-
 local function runSetup(id)
 	SetStatus("Initializing")
 	local paths = {
-		travel = { "Network", "AutumnService", "RF", "Travel" },
 		sync = { "Network", "AppleService", "RF", "Sync" },
 		roll = { "Network", "LeafDiceService", "RF", "Roll" },
 	}
@@ -334,41 +437,28 @@ local function runSetup(id)
 	end
 	if not sleep(id, CONFIG.StepDelay) then return nil end
 
-	-- 1. Teleport to Autumn World
+	-- 1. Ensure arrival in Autumn World
 	SetStatus("Teleporting")
-	local charBefore = player.Character
-	local hrpBefore = getHRP()
-	local posBefore = hrpBefore and hrpBefore.Position
-	local ok, res = invoke(remotes.travel, "Autumn")
+	local traveled, travelErr = AutumnTravel.ensureInAutumnWorld(function() return alive(id) end)
 	if not alive(id) then return nil end
-	if not ok or res == false then
-		return failAndStop(id, "Travel failed: " .. tostring(res)) and nil
-	end
-	local t0 = os.clock()
-	while alive(id) and os.clock() - t0 < 10 do
-		local hrp = getHRP()
-		if player.Character ~= charBefore then break end
-		if hrp and posBefore and (hrp.Position - posBefore).Magnitude > 100 then break end
-		task.wait(0.25)
-	end
-	if not alive(id) then return nil end
-	if not getHRP(15) then
-		return failAndStop(id, "Character did not load after teleport.") and nil
+	if not traveled then
+		return failAndStop(id, travelErr or "Travel failed.") and nil
 	end
 	if not sleep(id, CONFIG.TeleportSettle) then return nil end
 
+	
 	-- 2. Sync the player
 	SetStatus("Syncing")
-	ok, res = invoke(remotes.sync)
+	local ok, res = invoke(remotes.sync)
 	if not alive(id) then return nil end
 	if not ok or res == false then
 		return failAndStop(id, "Sync failed: " .. tostring(res)) and nil
 	end
 	if not sleep(id, CONFIG.StepDelay) then return nil end
 
-	-- 3. Move to the dice location
+	-- 3. Walk to the LeafDice zone
 	SetStatus("Moving")
-	local moved, err = moveTo(id, CONFIG.DiceLocation)
+	local moved, err = AutumnTravel.walkToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested end)
 	if not alive(id) then return nil end
 	if not moved then
 		return failAndStop(id, err or "Movement failed.") and nil
@@ -378,32 +468,68 @@ local function runSetup(id)
 	return remotes.roll
 end
 
+local function isAtLeafDice()
+	local zone, root = AutumnTravel.findZone("LeafDice"), getHRP()
+	return zone ~= nil and root ~= nil and (root.Position - zone:GetPivot().Position).Magnitude <= CONFIG.ArriveDistance
+end
+
 local function rollLoop(id, rollRemote)
 	local consecutiveErrors = 0
 	State.Rolls = 0
 
 	while alive(id) do
-		SetStatus("Rolling", ("Rolling Autumn Dice. Rolls completed: %d"):format(State.Rolls))
-		local ok, res = invoke(rollRemote, CONFIG.RollAmount)
-
-		-- the toggle may have been turned off during the roll: it finishes, nothing new starts
-		if not alive(id) then return end
-
-		if ok and res ~= false then
-			consecutiveErrors = 0
-			State.Rolls += 1
-			SetStatus("AutoRollEnabled", ("The custom rolling loop is active. Rolls completed: %d"):format(State.Rolls))
-			if not sleep(id, CONFIG.RollDelay) then return end
+		if AutumnTravel.questRequested then
+			task.wait(0.1)
 		else
-			consecutiveErrors += 1
-			local msg = ("Roll failed (%d/%d): %s"):format(consecutiveErrors, CONFIG.MaxRollErrors, tostring(res))
-			warn("[AutumnDice] " .. msg)
-			if consecutiveErrors >= CONFIG.MaxRollErrors then
-				failAndStop(id, msg .. " Auto Roll stopped.")
-				return
+			local owner = {}
+			if AutumnTravel.acquire(owner, function() return alive(id) end) then
+				if not alive(id) then
+					AutumnTravel.release(owner)
+					return
+				end
+
+				local moved, err = true, nil
+				if not isAtLeafDice() then
+					SetStatus("Moving", "Returning to the LeafDice zone before rolling.")
+					moved, err = AutumnTravel.walkToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested end)
+				end
+				if not moved or not isAtLeafDice() then
+					AutumnTravel.release(owner)
+					if not AutumnTravel.questRequested then
+						if alive(id) then failAndStop(id, err or "Could not verify arrival at LeafDice.") end
+						return
+					end
+				end
+
+				if AutumnTravel.questRequested or not alive(id) then
+					AutumnTravel.release(owner)
+				else
+					SetStatus("Rolling", ("Rolling Autumn Dice. Rolls completed: %d"):format(State.Rolls))
+					local called, ok, result = pcall(invoke, rollRemote, CONFIG.RollAmount)
+					AutumnTravel.release(owner)
+					if not called then ok, result = false, ok end
+					if not alive(id) then return end
+
+					if ok and result ~= false then
+						consecutiveErrors = 0
+						State.Rolls += 1
+						SetStatus("AutoRollEnabled", ("The custom rolling loop is active. Rolls completed: %d"):format(State.Rolls))
+						if not sleep(id, CONFIG.RollDelay) then return end
+					else
+						consecutiveErrors += 1
+						local msg = ("Roll failed (%d/%d): %s"):format(consecutiveErrors, CONFIG.MaxRollErrors, tostring(result))
+						warn("[AutumnDice] " .. msg)
+						if consecutiveErrors >= CONFIG.MaxRollErrors then
+							failAndStop(id, msg .. " Auto Roll stopped.")
+							return
+						end
+						SetStatus("Error", msg)
+						if not sleep(id, CONFIG.RollErrorDelay) then return end
+					end
+				end
+			else
+				task.wait(0.1)
 			end
-			SetStatus("Error", msg)
-			if not sleep(id, CONFIG.RollErrorDelay) then return end
 		end
 	end
 end
@@ -416,15 +542,24 @@ local function worker(id)
 	if not alive(id) then return end
 
 	workerActive = true
+	local owner = {}
+	local locked = AutumnTravel.acquire(owner, function() return alive(id) end)
+	local setupStarted = locked
 	local ok, err = pcall(function()
-		local rollRemote = runSetup(id)
-		if rollRemote and alive(id) then
-			rollLoop(id, rollRemote)
+		if locked and alive(id) then
+			local rollRemote = runSetup(id)
+			AutumnTravel.rollRemote = rollRemote
+			AutumnTravel.release(owner)
+			locked = false
+			if rollRemote and alive(id) then rollLoop(id, rollRemote) end
 		end
 	end)
+	if locked then AutumnTravel.release(owner) end
 	workerActive = false
 
-	if not ok then
+	if not setupStarted and alive(id) then
+		failAndStop(id, "Could not acquire movement lock.")
+	elseif not ok then
 		failAndStop(id, "Unexpected error: " .. tostring(err))
 	end
 end
@@ -433,7 +568,7 @@ end
 -- AUTO TOWER
 ----------------------------------------------------------------------
 -- Existing references (loaded lazily so a missing module shows an Error instead of crashing)
-local TurkeyTowers, TowerController, DataController, BuffController, EntryRegistry
+local TurkeyTowers, Towers, TowerController, DataController, BuffController, EntryRegistry
 local RESTART_COOLDOWN = CONFIG.TowerRestartCooldown
 
 local Tower = {
@@ -441,7 +576,11 @@ local Tower = {
 	lastLoadTry = -math.huge,
 	loadError = nil,
 
-	names = {},               -- current tower names from TurkeyTowers.Sections
+	names = {},               -- current tower names from Towers.GetAll()
+	options = {},
+	displayByName = {},
+	optionToName = {},
+	catalog = {},
 	activeName = nil,         -- tower the monitor is currently handling
 	lastStarted = false,      -- last start attempt for activeName succeeded / run assumed active
 	lockedSince = 0,          -- time of the last successful start (holds the Best Leaf Tower choice)
@@ -468,11 +607,12 @@ local function loadTowerModules()
 	local ok, err = pcall(function()
 		local features = ReplicatedStorage.Framework.Features
 		local tt = require(features.Autumn.TurkeyTowers)
+		local towers = require(features.Towers.Towers)
 		local tc = require(features.Towers.TowerController)
 		local dc = require(features.Data.DataController)
 		local bc = require(features.Buffs.BuffController)
 		local er = require(features.Inventory.EntryRegistry)
-		TurkeyTowers, TowerController, DataController, BuffController, EntryRegistry = tt, tc, dc, bc, er
+		TurkeyTowers, Towers, TowerController, DataController, BuffController, EntryRegistry = tt, towers, tc, dc, bc, er
 	end)
 
 	if not ok then
@@ -694,21 +834,25 @@ local function selectSingle(milestones)
 	end
 
 	local section, index = findSectionByName(name)
-	if not section then
-		return nil, "Error", ("\"%s\" is not an available tower."):format(name)
+	if section then
+		if not milestones then
+			return nil, "WaitingData", "Player data is not loaded yet."
+		end
+		local okU, unlocked = pcall(TurkeyTowers.IsUnlocked, milestones, index)
+		if not okU then
+			return nil, "Error", "Could not check whether the tower is unlocked."
+		end
+		if not unlocked then
+			return nil, "SingleLocked", ("%s is locked."):format(name)
+		end
+		return section
 	end
 
-	local okU, unlocked = pcall(TurkeyTowers.IsUnlocked, milestones, index)
-	if not okU then
-		return nil, "Error", "Could not check whether the tower is unlocked."
+	if Towers and Tower.catalog[name] then
+		return Tower.catalog[name]
 	end
-	if not unlocked then
-		return nil, "SingleLocked", ("%s is locked."):format(name)
-	end
-
-	return section
+	return nil, "Error", ("\"%s\" is not an available tower."):format(name)
 end
-
 -- --------------------------------------------------------------------------
 -- Tower control (shared by both modes)
 -- --------------------------------------------------------------------------
@@ -860,12 +1004,6 @@ local function driveTower(mode, section, extra)
 	if started then
 		Tower.lastStarted = true
 		Tower.lockedSince = os.clock()
-		local S = State.TowerStats
-		S.Runs += 1
-		S.RunFloors = 0
-		S.RunEnded = false
-		S.Floor = nil
-		notify()
 		SetTowerStatus(progressKey, detail)
 	elseif reason == "cooldown" or reason == "busy" or reason == "cancelled" then
 		-- nothing to do
@@ -894,14 +1032,7 @@ local function towerTick()
 	local section, key, detail
 
 	if mode == "Single" then
-		-- Single mode only needs the unlock data; completion and unit strength are never consulted
-		local milestones = getMilestones()
-		if not milestones then
-			Tower.activeName = nil
-			SetTowerStatus("WaitingData", "Player data is not loaded yet.")
-			return
-		end
-		section, key, detail = selectSingle(milestones)
+		section, key, detail = selectSingle(getMilestones())
 	else
 		-- Best Leaf Tower mode: best unit vs. floor 1 (see findNextSection)
 		mode = "Best Leaf Tower"
@@ -964,7 +1095,9 @@ local function SetTowerMode(mode)
 end
 
 local function SetSelectedTower(name)
-	if type(name) ~= "string" or not table.find(Tower.names, name) or State.SelectedTower == name then return end
+	if type(name) ~= "string" then return end
+	name = Tower.optionToName[name] or name
+	if not table.find(Tower.names, name) or State.SelectedTower == name then return end
 	State.SelectedTower = name
 	Tower.selectionEpoch += 1
 	Tower.activeName = nil
@@ -1004,12 +1137,11 @@ local function setAntiAfk(enabled)
 	local lp = Players.LocalPlayer
 	if not lp then
 		warn("[AutumnDice] Anti AFK unavailable: LocalPlayer not ready")
-		State.Features.AntiAfk = false -- keep the toggle truthful
+		State.Features.AntiAfk = false
 		return
 	end
 
 	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
-		-- simulate a right-click hold to reset the internal idle timer
 		pcall(function()
 			local camera = workspace.CurrentCamera
 			local cf = camera and camera.CFrame or CFrame.new()
@@ -1143,6 +1275,8 @@ local function setAutoReconnect(enabled)
 	Reconnect.conns = watchDisconnect(onReconnectNeeded)
 end
 
+local setAutoClaim
+
 local function SetFeature(name, value)
 	if State.Features[name] == nil then return end
 	value = value and true or false
@@ -1177,6 +1311,9 @@ local function SetFeature(name, value)
 	elseif name == "AutoReconnect" then
 		setAutoReconnect(value)
 		notify()
+	elseif name == "AutoClaimQuest" then
+		setAutoClaim(value)
+		notify()
 	else
 		notify()
 	end
@@ -1187,103 +1324,96 @@ local function GetFeature(name)
 end
 
 ----------------------------------------------------------------------
--- TOWER FLOOR TRACKING
--- Read-only: watches the results of Towers.CompleteTowerFloor (the game calls it for every
--- floor fight) to count Floors Cleared / Best Floor. The original results are returned untouched.
+-- TOWER STATS (Runs / Floors Cleared / Best Floor)
+-- Floors come from the game's own Floor label ("Floor N"): every increase counts as cleared
+-- floors, a drop means a new run began. Runs are counted by wrapping
+-- TowerController.startTower (successful starts only, manual ones included).
 ----------------------------------------------------------------------
-local FloorHook = { seen = setmetatable({}, { __mode = "k" }), restore = {} }
+local FloorTracker = { label = nil, labelConn = nil, original = nil, wrapped = false, alive = true }
 
-local function describeAction(action)
-	local parts = {}
-	for k, v in pairs(action) do
-		table.insert(parts, tostring(k) .. "=" .. (type(v) == "table" and "{...}" or tostring(v)))
-	end
-	return table.concat(parts, ", ")
+local function readFloorText(text)
+	return tonumber(tostring(text):match("Floor%s+(%d+)"))
 end
 
-local function onFloorResult(result)
-	if typeof(result) ~= "table" or FloorHook.seen[result] then return end
-	FloorHook.seen[result] = true
-
-	local ended, otherActions, explicitFloor = false, false, nil
-	for i, action in ipairs(result) do
-		if type(action) == "table" then
-			if CONFIG.DebugTowerFloors then
-				print(("[AutumnDice] CompleteTowerFloor action %d: %s"):format(i, describeAction(action)))
-			end
-			if action.action == "ended" then
-				ended = true
-			else
-				otherActions = true
-			end
-			local f = action.floor or action.currentFloor
-			if type(f) == "number" then explicitFloor = f end
-		end
-	end
+local function updateFloor()
+	local label = FloorTracker.label
+	if not label then return end
+	local floor = readFloorText(label.Text)
+	if not floor then return end
 
 	local S = State.TowerStats
-	if S.RunEnded then -- the previous run is over: this call belongs to a new one
-		S.RunFloors = 0
-		S.RunEnded = false
+	if S.LastFloor then
+		if floor > S.LastFloor then
+			S.Floors += floor - S.LastFloor
+		elseif floor < S.LastFloor then
+			S.LastFloor = nil -- the floor counter reset: a new run began
+		end
 	end
-
-	-- a result that only says "ended" is the fight that was lost, so no floor was cleared
-	if explicitFloor or otherActions or not ended then
-		S.RunFloors += 1
-		S.Floors += 1
-		S.Floor = explicitFloor or S.RunFloors
-		S.Tracking = true
-		if S.Floor > S.Best then S.Best = S.Floor end
-	end
-	if ended then S.RunEnded = true end
+	S.Best = math.max(S.Best, floor)
+	S.LastFloor = floor
+	S.Floor = floor
+	S.Tracking = true
 	notify()
 end
 
-local function wrapFloorCall(original)
-	return function(self, name, ...)
-		local packed = table.pack(original(self, name, ...))
-		if name == "CompleteTowerFloor" then
-			pcall(onFloorResult, packed[1])
-		end
-		return table.unpack(packed, 1, packed.n)
-	end
+local function connectFloorLabel()
+	if FloorTracker.label then return true end
+	local ok, label = pcall(function()
+		local features = ReplicatedStorage.Framework.Features
+		local UIReferences = require(features.UI.UIReferences)
+		return UIReferences.Root.Tower.Screen.Floor
+	end)
+	if not ok or typeof(label) ~= "Instance" then return false end
+
+	FloorTracker.label = label
+	FloorTracker.labelConn = label:GetPropertyChangedSignal("Text"):Connect(updateFloor)
+	updateFloor()
+	return true
 end
 
-local function installFloorHook()
-	local ok, err = pcall(function()
-		local Network = require(ReplicatedStorage.Packages.Network)
-		local cls = Network.ClientComm
+local function wrapStartTower()
+	if FloorTracker.wrapped then return true end
+	if not loadTowerModules() or not TowerController then return false end
+	local original = TowerController.startTower
+	if type(original) ~= "function" then return false end
 
-		-- class level: sees the game's own Towers comm (skipped if the class has no CallFunction)
-		local clsOriginal = type(cls) == "table" and rawget(cls, "CallFunction")
-		if type(clsOriginal) == "function" then
-			cls.CallFunction = wrapFloorCall(clsOriginal)
-			table.insert(FloorHook.restore, function() cls.CallFunction = clsOriginal end)
+	FloorTracker.original = original
+	TowerController.startTower = function(...)
+		local result = table.pack(original(...))
+		if result[1] then
+			local S = State.TowerStats
+			S.Runs += 1
+			S.LastFloor = nil
+			S.Floor = nil
+			notify()
 		end
-
-		-- instance level
-		local okComm, comm = pcall(function() return cls.new(ReplicatedStorage.Network, false, "Towers") end)
-		if not okComm then comm = cls.new(ReplicatedStorage.Network, "Towers") end
-		local instRaw = rawget(comm, "CallFunction")
-		local instOriginal = comm.CallFunction
-		if type(instOriginal) == "function" then
-			comm.CallFunction = wrapFloorCall(instOriginal)
-			table.insert(FloorHook.restore, function() comm.CallFunction = instRaw end)
-		end
-	end)
-	if not ok then
-		warn("[AutumnDice] Floor tracking unavailable: " .. tostring(err))
+		return table.unpack(result, 1, result.n)
 	end
+	FloorTracker.wrapped = true
+	return true
 end
 
 local function uninstallFloorHook()
-	for i = #FloorHook.restore, 1, -1 do
-		pcall(FloorHook.restore[i])
+	FloorTracker.alive = false
+	if FloorTracker.labelConn then
+		FloorTracker.labelConn:Disconnect()
+		FloorTracker.labelConn = nil
 	end
-	FloorHook.restore = {}
+	if FloorTracker.wrapped and TowerController and FloorTracker.original then
+		pcall(function() TowerController.startTower = FloorTracker.original end)
+		FloorTracker.wrapped = false
+	end
 end
 
-task.spawn(installFloorHook)
+-- the game's modules / UI may not exist yet: keep trying until both are hooked
+task.spawn(function()
+	while FloorTracker.alive do
+		local labelOk = connectFloorLabel()
+		local wrapOk = wrapStartTower()
+		if labelOk and wrapOk then break end
+		task.wait(2)
+	end
+end)
 
 ----------------------------------------------------------------------
 -- GUI
@@ -1478,7 +1608,7 @@ local bodyRow = create("Frame", {
 })
 
 local sidebar = create("ScrollingFrame", {
-	Size = UDim2.new(0, 104, 1, 0),
+	Size = UDim2.new(0, 208, 1, 0),
 	BackgroundColor3 = THEME.card,
 	BorderSizePixel = 0,
 	ScrollBarThickness = 0,
@@ -1490,8 +1620,8 @@ local sidebar = create("ScrollingFrame", {
 
 -- the tab pages live in here; it scrolls whenever a page is taller than the window
 local content = create("ScrollingFrame", {
-	Position = UDim2.fromOffset(104 + SIDEBAR_GAP, 0),
-	Size = UDim2.new(1, -(104 + SIDEBAR_GAP), 1, 0),
+	Position = UDim2.fromOffset(208 + SIDEBAR_GAP, 0),
+	Size = UDim2.new(1, -(208 + SIDEBAR_GAP), 1, 0),
 	BackgroundTransparency = 1,
 	BorderSizePixel = 0,
 	ScrollBarThickness = 3,
@@ -1568,7 +1698,7 @@ local function applyLayout()
 	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
 	local w = math.min(math.clamp(math.floor(vp.X * 0.5), 320, 640), vp.X - 16)
 	local h = math.min(math.clamp(math.floor(vp.Y * 0.75), 220, 580), vp.Y - 16)
-	local sideW = (w >= 340) and 104 or 88
+	local sideW = (w >= 340) and 208 or 176
 
 	-- two cards side by side only when each card would still be wide enough to read
 	local contentW = w - 16 - (sideW + SIDEBAR_GAP) - 6
@@ -1645,7 +1775,7 @@ local function addTab(order, name)
 		BackgroundTransparency = 1,
 		Text = name,
 		Font = Enum.Font.GothamMedium,
-		TextSize = 11,
+		TextSize = 13,
 		TextColor3 = THEME.body,
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -1941,7 +2071,7 @@ end
 ----------------------------------------------------------------------
 -- Tab: Auto Roll
 ----------------------------------------------------------------------
-local rollBody = makeCard(addTab(1, "Auto Roll").left, function(tile)
+local rollBody = makeCard(addTab(1, "Roll").left, function(tile)
 	create("TextLabel", {
 		Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1,
@@ -1963,6 +2093,30 @@ local rollInfo = create("Frame", {
 }, { vlist(4) })
 
 local rollCount = makeLine(rollInfo, 1, 12, THEME.subtext)
+local leafBalance = makeLine(rollInfo, 2, 12, THEME.subtext)
+local leafBalanceValue = 0
+local leafBalanceHooked = false
+task.spawn(function()
+	while gui.Parent and not leafBalanceHooked do
+		local ok = pcall(function()
+			local features = ReplicatedStorage.Framework.Features
+			local DataController = require(features.Data.DataController)
+			local AutumnConfig = require(features.Autumn.AutumnConfig)
+			local Leaves = AutumnConfig.Currencies.Leaves
+			local inventory = DataController.Inventory[Leaves]
+			local entry = inventory()
+			leafBalanceValue = entry and entry.amount or 0
+			inventory.Observe(function(entry)
+				leafBalanceValue = entry and entry.amount or 0
+			end)
+		end)
+		if ok then
+			leafBalanceHooked = true
+		else
+			task.wait(1)
+		end
+	end
+end)
 
 ----------------------------------------------------------------------
 -- Tab: Auto Tower
@@ -2007,31 +2161,9 @@ local towerInfo = create("Frame", {
 
 local towerLine = makeLine(towerInfo, 1, 12, THEME.body, Enum.Font.GothamMedium)
 
-local statsRow = create("Frame", {
-	LayoutOrder = 2,
-	Size = UDim2.new(1, 0, 0, 0),
-	AutomaticSize = Enum.AutomaticSize.Y,
-	BackgroundTransparency = 1,
-	Parent = towerInfo,
-}, { vlist(2) })
-local function statLabel(order)
-	return create("TextLabel", {
-		LayoutOrder = order,
-		Size = UDim2.new(1, 0, 0, 16),
-		BackgroundTransparency = 1,
-		Text = "",
-		Font = Enum.Font.Gotham,
-		TextSize = 11,
-		TextColor3 = THEME.subtext,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Parent = statsRow,
-	})
-end
-local runsLabel = statLabel(1)
-local floorsLabel = statLabel(2)
-local bestLabel = statLabel(3)
-
+local statsLine = makeLine(towerInfo, 2, 10, THEME.subtext)
+statsLine.TextWrapped = false
+statsLine.TextTruncate = Enum.TextTruncate.AtEnd
 ----------------------------------------------------------------------
 -- Tab: Miscellaneous
 ----------------------------------------------------------------------
@@ -2078,9 +2210,20 @@ local function questIcon(tile)
 end
 
 local eventTab = addTab(4, "Event")
-local questBody = makeCard(eventTab.left, questIcon, "Quest")
+local rollCard = rollBody.Parent
+rollCard.Parent = eventTab.left
+rollCard.LayoutOrder = 1
+local questBody = makeCard(eventTab.right, questIcon, "Quest")
+makeToggle(questBody, 1, "Auto Claim Quest", "AutoClaimQuest")
+local questList = create("Frame", {
+	LayoutOrder = 2,
+	Size = UDim2.new(1, 0, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundTransparency = 1,
+	Parent = questBody,
+}, { vlist(4) })
 
-local Quests = { loaded = false, hooked = false, hooks = {}, signature = nil }
+local Quests = { loaded = false, hooked = {}, hooks = {}, signature = nil, dirty = true }
 
 local QUEST_STATUS = {
 	progress = { text = "In Progress", color = THEME.accent },
@@ -2234,7 +2377,7 @@ local function renderQuests()
 	if signature == Quests.signature then return end
 	Quests.signature = signature
 
-	for _, child in ipairs(questBody:GetChildren()) do
+	for _, child in ipairs(questList:GetChildren()) do
 		if child:IsA("GuiObject") then child:Destroy() end
 	end
 
@@ -2244,7 +2387,7 @@ local function renderQuests()
 			Size = UDim2.new(1, 0, 0, 0),
 			AutomaticSize = Enum.AutomaticSize.Y,
 			BackgroundTransparency = 1,
-			Parent = questBody,
+			Parent = questList,
 		}, { vlist(4) })
 
 		makeLine(block, 1, 12, THEME.text, Enum.Font.GothamBold).Text = sec.title
@@ -2260,30 +2403,25 @@ local function renderQuests()
 	end
 end
 
-local questRenderScheduled = false
 local function scheduleQuestRender()
-	if questRenderScheduled then return end
-	questRenderScheduled = true
-	task.defer(function()
-		questRenderScheduled = false
-		pcall(renderQuests)
-	end)
+	Quests.dirty = true
 end
-
 -- Re-render on any Daily/Hourly change: progress, claims, newly rolled quests
 local function hookQuestChanges()
-	if Quests.hooked or not Quests.loaded then return end
-	Quests.hooked = true
-	pcall(function()
-		for _, period in Quests.Config.Periods do
+	if not Quests.loaded then return end
+	for _, period in Quests.Config.Periods do
+		local key = period.id or period.dataKey
+		if not Quests.hooked[key] then
 			local ok, conn = pcall(function()
 				return Quests.DataController[period.dataKey].Changed(scheduleQuestRender)
 			end)
-			if ok and conn ~= nil then table.insert(Quests.hooks, conn) end
+			if ok then
+				Quests.hooked[key] = true
+				if conn ~= nil then table.insert(Quests.hooks, conn) end
+			end
 		end
-	end)
+	end
 end
-
 local function unhookQuests()
 	for _, conn in ipairs(Quests.hooks) do
 		pcall(function()
@@ -2297,19 +2435,225 @@ local function unhookQuests()
 		end)
 	end
 	Quests.hooks = {}
+	Quests.hooked = {}
 end
 
--- Loads the game modules once they exist, then keeps a slow safety-net refresh
+local AutoClaim = {
+	loaded = false,
+	token = 0,
+	workerActive = false,
+	claimInFlight = false,
+	lastAttempt = {},
+	lastSyncAttempt = 0,
+}
+
+local function loadAutoClaimModules()
+	if AutoClaim.loaded then return true end
+	if not loadQuestModules() then return false end
+
+	local ok = pcall(function()
+		local features = ReplicatedStorage.Framework.Features
+		local Network = require(ReplicatedStorage.Packages.Network)
+		local questComm = Network.ClientComm.new(ReplicatedStorage.Network, false, "AutumnQuestService")
+		AutoClaim.AutumnConfig = require(features.Autumn.AutumnConfig)
+		AutoClaim.claimQuest = questComm:GetFunction("Claim")
+		AutoClaim.claimBonus = questComm:GetFunction("ClaimBonus")
+		AutoClaim.sync = questComm:GetFunction("Sync")
+	end)
+	AutoClaim.loaded = ok
+	return ok
+end
+local function autoClaimEnabled(token)
+	return AutoClaim.token == token and State.Features.AutoClaimQuest
+end
+
+local function autoClaimActive(token)
+	return autoClaimEnabled(token) and AutoClaim.AutumnConfig.ACTIVE == true
+end
+
+local function isAtQuestBoard()
+	local zone = AutumnTravel.findZone("AutumnQuests")
+	local root = getHRP()
+	return zone ~= nil and root ~= nil and (root.Position - zone:GetPivot().Position).Magnitude < 8
+end
+
+local function ensureQuestBoard(token)
+	local shouldContinue = function() return autoClaimActive(token) end
+	local arrived, err = AutumnTravel.ensureInAutumnWorld(shouldContinue)
+	if not arrived then return false, err end
+	return AutumnTravel.walkToZone("AutumnQuests", shouldContinue)
+end
+local function readClaimState(period)
+	local ok, raw = pcall(Quests.DataController[period.dataKey])
+	if not ok or type(raw) ~= "table" or type(raw.quests) ~= "table" then return nil end
+	return {
+		quests = raw.quests,
+		progress = type(raw.progress) == "table" and raw.progress or {},
+		claimed = type(raw.claimed) == "table" and raw.claimed or {},
+		bonusClaimed = raw.bonusClaimed == true,
+	}
+end
+
+local function requestQuestClaim(token, key, callback, argument)
+	if not autoClaimActive(token) or not AutumnTravel.isInAutumnWorld() or not isAtQuestBoard() then return false end
+	local now = os.clock()
+	if AutoClaim.claimInFlight or now - (AutoClaim.lastAttempt[key] or -math.huge) < 5 then return false end
+	AutoClaim.claimInFlight = true
+	local ok, result = pcall(callback, argument)
+	AutoClaim.claimInFlight = false
+	AutoClaim.lastAttempt[key] = os.clock()
+	return ok and result ~= false
+end
+
+local function autoClaimPeriod(token, period)
+	local state = readClaimState(period)
+	if not state or #state.quests == 0 then return end
+
+	for _, questId in state.quests do
+		if not autoClaimActive(token) or not isAtQuestBoard() then return end
+		if state.claimed[questId] ~= true then
+			local ok, quest = pcall(Quests.Config.GetQuest, questId)
+			local progress = state.progress[questId]
+			progress = type(progress) == "number" and math.max(progress, 0) or 0
+			if ok and type(quest) == "table" and type(quest.target) == "number" and progress >= quest.target then
+				requestQuestClaim(token, "quest:" .. tostring(period.id) .. ":" .. tostring(questId), AutoClaim.claimQuest, questId)
+			end
+		end
+	end
+
+	state = readClaimState(period)
+	if not state or state.bonusClaimed then return end
+	for _, questId in state.quests do
+		if state.claimed[questId] ~= true then return end
+	end
+	requestQuestClaim(token, "bonus:" .. tostring(period.id), AutoClaim.claimBonus, period.id)
+end
+
+local function hasClaimableQuest()
+	for _, period in Quests.Config.Periods do
+		local state = readClaimState(period)
+		if state then
+			local allClaimed = #state.quests > 0
+			for _, questId in state.quests do
+				if state.claimed[questId] ~= true then
+					allClaimed = false
+					local ok, quest = pcall(Quests.Config.GetQuest, questId)
+					local progress = state.progress[questId]
+					if ok and type(quest) == "table" and type(quest.target) == "number" and type(progress) == "number" and progress >= quest.target then
+						return true
+					end
+				end
+			end
+			if allClaimed and not state.bonusClaimed then return true end
+		end
+	end
+	return false
+end
+
+local function autoClaimWorker(token)
+	while AutoClaim.workerActive and autoClaimEnabled(token) do task.wait(0.1) end
+	if not autoClaimEnabled(token) then return end
+	AutoClaim.workerActive = true
+	local lastCharacter, needsSync = nil, true
+
+	while autoClaimEnabled(token) do
+		if not loadAutoClaimModules() then
+			task.wait(1)
+		elseif not autoClaimActive(token) then
+			task.wait(1)
+		else
+			if player.Character ~= lastCharacter then
+				lastCharacter = player.Character
+				needsSync = true
+			end
+
+			if State.Features.AutoDice and not hasClaimableQuest() then
+				task.wait(1)
+			else
+				local owner = {}
+				AutumnTravel.questRequested = true
+				if AutumnTravel.acquire(owner, function() return autoClaimEnabled(token) end) then
+					local ok, err = pcall(function()
+						if not AutumnTravel.isInAutumnWorld() or not isAtQuestBoard() then
+							needsSync = true
+							local arrived, travelErr = ensureQuestBoard(token)
+							if not arrived then error(travelErr or "Could not reach Quest Board.") end
+						end
+						if not autoClaimActive(token) or not isAtQuestBoard() then return end
+
+						if needsSync and os.clock() - AutoClaim.lastSyncAttempt >= 3 then
+							AutoClaim.lastSyncAttempt = os.clock()
+							local synced, result = pcall(AutoClaim.sync)
+							if synced and result ~= false then
+								needsSync = false
+								task.wait(1)
+							end
+						end
+						if not needsSync then
+							for _, period in Quests.Config.Periods do
+								if not autoClaimActive(token) or not isAtQuestBoard() then break end
+								pcall(autoClaimPeriod, token, period)
+							end
+						end
+
+						if State.Features.AutoDice and autoClaimEnabled(token) then
+							local returned, returnErr = AutumnTravel.walkToZone("LeafDice", function() return autoClaimEnabled(token) end)
+							if not returned or not isAtLeafDice() then error(returnErr or "Could not verify return to LeafDice.") end
+						end
+					end)
+					AutumnTravel.release(owner)
+					AutumnTravel.questRequested = false
+					if not ok then task.wait(1) end
+				else
+					AutumnTravel.questRequested = false
+				end
+				task.wait(1)
+			end
+		end
+	end
+
+	AutoClaim.workerActive = false
+end
+setAutoClaim = function(enabled)
+	AutoClaim.token += 1
+	
+end
+
 task.spawn(function()
 	while gui.Parent do
-		if loadQuestModules() then hookQuestChanges() end
-		pcall(renderQuests)
-		task.wait(3)
+		if State.Features.AutoClaimQuest then
+			local ok = pcall(autoClaimWorker, AutoClaim.token)
+			AutoClaim.workerActive = false
+			if not ok then task.wait(1) end
+		else
+			task.wait(0.1)
+		end
 	end
 end)
-
+-- Render once data loads, then refresh on changes with a slow safety-net pass.
+task.spawn(function()
+	local nextLoadTry, nextHookTry, lastRender = 0, 0, 0
+	while gui.Parent do
+		local now = os.clock()
+		if not Quests.loaded and now >= nextLoadTry and not loadQuestModules() then
+			nextLoadTry = now + 1
+		end
+		if Quests.loaded then
+			if now >= nextHookTry then
+				hookQuestChanges()
+				nextHookTry = now + 3
+			end
+			if Quests.dirty or now - lastRender >= 3 then
+				Quests.dirty = false
+				pcall(renderQuests)
+				lastRender = now
+			end
+		end
+		task.wait(0.1)
+	end
+end)
 refreshColumns()
-selectTab("Auto Roll")
+selectTab("Roll")
 
 ----------------------------------------------------------------------
 -- Footer: hotkey
@@ -2395,29 +2739,55 @@ do
 	end))
 end
 
--- Keep the "Tower" dropdown in sync with TurkeyTowers.Sections
+-- Keep the dropdown in sync with the configured tower catalog
 local lastSignature = nil
 local function refreshTowerOptions()
 	if not loadTowerModules() then return end
 
-	local names = {}
-	local ok = pcall(function()
-		for _, section in ipairs(TurkeyTowers.Sections) do
-			if type(section) == "table" and type(section.name) == "string" then
-				table.insert(names, section.name)
-			end
-		end
-	end)
-	if not ok then return end
+	local ok, all = pcall(Towers.GetAll)
+	if not ok or type(all) ~= "table" then return end
 
-	local signature = table.concat(names, "\n")
+	local turkeyNames, catalog = {}, {}
+	for _, section in ipairs(TurkeyTowers.Sections) do
+		if type(section) == "table" and type(section.name) == "string" then
+			turkeyNames[section.name] = true
+		end
+	end
+
+	for key, tower in pairs(all) do
+		local name = type(tower) == "table" and (tower.name or tower.Name) or tower
+		name = type(name) == "string" and name or (type(key) == "string" and key or nil)
+		if name then
+			local order = type(tower) == "table" and tonumber(tower.order or tower.Order) or nil
+			catalog[name] = { name = name, order = order or math.huge }
+		end
+	end
+
+	local entries = {}
+	for _, tower in pairs(catalog) do table.insert(entries, tower) end
+	table.sort(entries, function(a, b)
+		if a.order == b.order then return a.name < b.name end
+		return a.order < b.order
+	end)
+
+	local names, options, displayByName, optionToName = {}, {}, {}, {}
+	for _, tower in ipairs(entries) do
+		local name = tower.name
+		local display = turkeyNames[name] and ("Turkey · " .. name) or name
+		table.insert(names, name)
+		table.insert(options, display)
+		displayByName[name] = display
+		optionToName[display] = name
+	end
+
+	local signature = table.concat(options, "\n")
 	if signature == lastSignature then return end
 	lastSignature = signature
 
-	Tower.names = names
-	towerDropdown.SetOptions(names)
+	Tower.names, Tower.options = names, options
+	Tower.displayByName, Tower.optionToName, Tower.catalog = displayByName, optionToName, catalog
+	towerDropdown.SetOptions(options)
 
-	-- keep the selection valid when the list changes
 	if not State.SelectedTower or not table.find(names, State.SelectedTower) then
 		State.SelectedTower = names[1]
 		Tower.activeName = nil
@@ -2426,7 +2796,6 @@ local function refreshTowerOptions()
 	Tower.wake = true
 	notify()
 end
-
 -- GUI <- State sync
 local function refreshGui()
 	for _, fn in ipairs(refreshers) do fn() end
@@ -2434,17 +2803,16 @@ local function refreshGui()
 	-- Auto Roll
 	-- each successful Roll call rolls CONFIG.RollAmount dice
 	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls * CONFIG.RollAmount))
+	leafBalance.Text = ("Leaf Balance: %s"):format(formatNumber(leafBalanceValue))
 
 	-- Auto Tower
 	local S = State.TowerStats
 	local floorText = S.Floor and (" floor " .. S.Floor) or ""
-	towerLine.Text = Tower.activeName and ("Tower: " .. Tower.activeName .. floorText) or "Tower: -"
-	runsLabel.Text = ("%d Runs"):format(S.Runs)
-	floorsLabel.Text = (S.Tracking and tostring(S.Floors) or "-") .. " Floors Cleared"
-	bestLabel.Text = "Best Floor " .. ((S.Tracking and S.Best > 0) and tostring(S.Best) or "-")
+	towerLine.Text = Tower.activeName and ("Tower: " .. (Tower.displayByName[Tower.activeName] or Tower.activeName) .. floorText) or "Tower: -"
+	statsLine.Text = ("%d Runs | %s Floors Cleared | Best Floor %s"):format(S.Runs, S.Tracking and tostring(S.Floors) or "-", (S.Tracking and S.Best > 0) and tostring(S.Best) or "-")
 
 	modeDropdown.SetValue(State.TowerMode)
-	towerDropdown.SetValue(State.SelectedTower)
+	towerDropdown.SetValue(Tower.displayByName[State.SelectedTower] or State.SelectedTower)
 	towerDropdown.SetDimmed(State.TowerMode ~= "Single") -- the Tower pick only applies in Single mode
 
 	refreshHotkey()
@@ -2471,6 +2839,8 @@ local function Unload()
 	setAutoReconnect(false)
 	uninstallFloorHook()
 	unhookQuests()
+	setAutoClaim(false)
+	State.Features.AutoClaimQuest = false
 	State.Features.AutoDice = false
 	State.Features.AutoTower = false
 	runId += 1
@@ -2491,6 +2861,7 @@ env.AutumnDice = {
 	GetTowerStatus = function() return State.TowerStatus, State.TowerDetail end,
 	SetHotkey = function(keyCode) State.Hotkey = keyCode notify() end,
 	Unload = Unload,
+	Travel = AutumnTravel,
 }
 
 ----------------------------------------------------------------------
