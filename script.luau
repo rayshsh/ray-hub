@@ -348,18 +348,20 @@ local function stopWalking(humanoid)
 	end)
 end
 function AutumnTravel.walkToZone(zoneName, shouldContinue)
+	local PathfindingService = game:GetService("PathfindingService")
+	local function positionOf(zone)
+		return zone:GetPivot().Position
+	end
+
 	local zone = AutumnTravel.findZone(zoneName)
 	if not zone then return false, "Zone not found: " .. tostring(zoneName) end
-
 	local characterDeadline = os.clock() + 15
-	while canContinue(shouldContinue) and not getHRP() and os.clock() < characterDeadline do
-		task.wait(0.2)
-	end
+	while canContinue(shouldContinue) and not getHRP() and os.clock() < characterDeadline do task.wait(0.2) end
 	if not canContinue(shouldContinue) then return false, "Cancelled." end
 	if not getHRP() then return false, "Character not found." end
 
 	local deadline = os.clock() + 30
-	local movingHumanoid, nextMove = nil, 0
+	local movingHumanoid
 	while canContinue(shouldContinue) and os.clock() < deadline do
 		zone = AutumnTravel.findZone(zoneName)
 		if not zone then
@@ -370,27 +372,91 @@ function AutumnTravel.walkToZone(zoneName, shouldContinue)
 		local character = player.Character
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local target = positionOf(zone)
 		if humanoid and root and humanoid.Health > 0 then
-			if (root.Position - zone:GetPivot().Position).Magnitude <= CONFIG.ArriveDistance then
+			if (root.Position - target).Magnitude <= CONFIG.ArriveDistance then
 				stopWalking(humanoid)
 				return true
 			end
-			if humanoid ~= movingHumanoid or os.clock() >= nextMove then
-				local moved = pcall(function() humanoid:MoveTo(zone:GetPivot().Position) end)
+
+			local path = PathfindingService:CreatePath()
+			local computed = pcall(function() path:ComputeAsync(root.Position, target) end)
+			local waypoints = computed and path.Status == Enum.PathStatus.Success and path:GetWaypoints() or {{ Position = target }}
+			local blockedAt, currentWaypoint = nil, 1
+			local blockedConnection = path.Blocked:Connect(function(index)
+				if index >= currentWaypoint then blockedAt = index end
+			end)
+			local replan = false
+
+			for index, waypoint in ipairs(waypoints) do
+				currentWaypoint = index
+				if not canContinue(shouldContinue) then
+					blockedConnection:Disconnect()
+					stopWalking(humanoid)
+					return false, "Cancelled."
+				end
+				if player.Character ~= character or humanoid.Health <= 0 then
+					replan = true
+					break
+				end
+				if blockedAt then
+					replan = true
+					break
+				end
+
+				if waypoint.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
+				local moved = pcall(function() humanoid:MoveTo(waypoint.Position) end)
 				if not moved then
+					blockedConnection:Disconnect()
 					stopWalking(humanoid)
 					return false, "Could not move to zone: " .. tostring(zoneName)
 				end
 				movingHumanoid = humanoid
-				nextMove = os.clock() + 5
+
+				local lastPosition, lastProgress = root.Position, os.clock()
+				while canContinue(shouldContinue) and os.clock() < deadline do
+					if player.Character ~= character or humanoid.Health <= 0 or blockedAt then
+						replan = true
+						break
+					end
+					local currentRoot = character:FindFirstChild("HumanoidRootPart")
+					if not currentRoot then
+						replan = true
+						break
+					end
+					if (currentRoot.Position - waypoint.Position).Magnitude <= 3 then break end
+					if (currentRoot.Position - lastPosition).Magnitude >= 1 then
+						lastPosition, lastProgress = currentRoot.Position, os.clock()
+					elseif os.clock() - lastProgress >= 3 then
+						replan = true
+						break
+					end
+					task.wait(0.2)
+				end
+				if not canContinue(shouldContinue) then
+					blockedConnection:Disconnect()
+					stopWalking(humanoid)
+					return false, "Cancelled."
+				end
+				if replan or os.clock() >= deadline then break end
 			end
+
+			blockedConnection:Disconnect()
+			if not replan then
+				local currentRoot = character:FindFirstChild("HumanoidRootPart")
+				if currentRoot and (currentRoot.Position - positionOf(zone)).Magnitude <= CONFIG.ArriveDistance then
+					stopWalking(humanoid)
+					return true
+				end
+			end
+			stopWalking(humanoid)
+			if player.Character == character and not replan then task.wait(0.2) end
 		end
-		task.wait(0.25)
 	end
 
 	stopWalking(movingHumanoid)
 	if not canContinue(shouldContinue) then return false, "Cancelled." end
-	return false, "Timed out walking to zone: " .. tostring(zoneName)
+	return false, "Timed out or could not find a clear path to zone: " .. tostring(zoneName)
 end
 ----------------------------------------------------------------------
 -- AUTO ROLL
@@ -1137,11 +1203,12 @@ local function setAntiAfk(enabled)
 	local lp = Players.LocalPlayer
 	if not lp then
 		warn("[AutumnDice] Anti AFK unavailable: LocalPlayer not ready")
-		State.Features.AntiAfk = false
+		State.Features.AntiAfk = false -- keep the toggle truthful
 		return
 	end
 
 	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
+		-- simulate a right-click hold to reset the internal idle timer
 		pcall(function()
 			local camera = workspace.CurrentCamera
 			local cf = camera and camera.CFrame or CFrame.new()
@@ -2567,7 +2634,7 @@ local function autoClaimWorker(token)
 				needsSync = true
 			end
 
-			if State.Features.AutoDice and not hasClaimableQuest() then
+			if not hasClaimableQuest() then
 				task.wait(1)
 			else
 				local owner = {}
