@@ -95,7 +95,7 @@ local TOWER_MODES = { "Single", "Best Leaf Tower" }
 ----------------------------------------------------------------------
 local State = {
 	Features = {
-		AutoDice = false, AutoTower = false, AutoEquipBest = false,
+		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false,
 		-- Miscellaneous
 		AntiAfk = false, AutoReconnect = false, AutoClaimQuest = false,
 	},
@@ -255,7 +255,7 @@ local function getHRP(timeout)
 	return nil
 end
 
-local AutumnTravel = { travelRemote = nil, traveling = false, movementOwner = nil, questRequested = false }
+local AutumnTravel = { travelRemote = nil, traveling = false, movementOwner = nil, questRequested = false, autoQuestMoving = false }
 
 local function canContinue(shouldContinue)
 	return not shouldContinue or shouldContinue()
@@ -279,6 +279,15 @@ function AutumnTravel.findZone(zoneName)
 	local zones = workspace:FindFirstChild("Zones")
 	local zone = zones and zones:FindFirstChild(zoneName)
 	return zone and (zone:IsA("BasePart") or zone:IsA("Model")) and zone or nil
+end
+
+function AutumnTravel.isNearZone(zoneName, margin)
+	local zone, root = AutumnTravel.findZone(zoneName), getHRP()
+	if not zone or not root then return false end
+	local frame, size = zone:IsA("Model") and zone:GetBoundingBox() or zone.CFrame, zone:IsA("Model") and select(2, zone:GetBoundingBox()) or zone.Size
+	local localPosition = frame:PointToObjectSpace(root.Position)
+	local half = size / 2 + Vector3.new(margin or 0, margin or 0, margin or 0)
+	return math.abs(localPosition.X) <= half.X and math.abs(localPosition.Y) <= half.Y and math.abs(localPosition.Z) <= half.Z
 end
 
 function AutumnTravel.isInAutumnWorld()
@@ -347,150 +356,31 @@ local function stopWalking(humanoid)
 		humanoid:Move(Vector3.zero)
 	end)
 end
-function AutumnTravel.walkToZone(zoneName, shouldContinue)
-	local PathfindingService = game:GetService("PathfindingService")
-	local function positionOf(zone)
-		return zone:GetPivot().Position
-	end
-
+function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
 	local zone = AutumnTravel.findZone(zoneName)
 	if not zone then return false, "Zone not found: " .. tostring(zoneName) end
-	local characterDeadline = os.clock() + 15
-	while canContinue(shouldContinue) and not getHRP() and os.clock() < characterDeadline do task.wait(0.2) end
+	local root = getHRP(15)
 	if not canContinue(shouldContinue) then return false, "Cancelled." end
-	if not getHRP() then return false, "Character not found." end
-
-	local deadline = os.clock() + 30
-	local movingHumanoid
-	local recoveryCount = 0
-	local function recoverFromStuck(humanoid, character, deadline)
-		recoveryCount += 1
-		local side = recoveryCount % 2 == 1 and 1 or -1
-		for _, direction in ipairs({ "back", "side" }) do
-			if not canContinue(shouldContinue) then return false, "Cancelled." end
-			if player.Character ~= character or humanoid.Health <= 0 then return true end
-			local root = character:FindFirstChild("HumanoidRootPart")
-			if not root then return true end
-			local forward = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
-			local right = Vector3.new(root.CFrame.RightVector.X, 0, root.CFrame.RightVector.Z)
-			if forward.Magnitude < 0.01 or right.Magnitude < 0.01 then return true end
-			local offset = direction == "back" and -forward.Unit * 3.5 or right.Unit * side * 4
-			local destination = root.Position + offset
-			if pcall(function() humanoid:MoveTo(destination) end) then
-				local attemptDeadline = math.min(deadline, os.clock() + 1.25)
-				while canContinue(shouldContinue) and os.clock() < attemptDeadline do
-					if player.Character ~= character or humanoid.Health <= 0 then return true end
-					root = character:FindFirstChild("HumanoidRootPart")
-					if not root or (root.Position - destination).Magnitude <= 2 then break end
-					task.wait(0.1)
-				end
-			end
-		end
-		stopWalking(humanoid)
+	if not root then return false, "Character not found." end
+	local frame, size = zone:IsA("Model") and zone:GetBoundingBox() or zone.CFrame, zone:IsA("Model") and select(2, zone:GetBoundingBox()) or zone.Size
+	local offsets = zoneName == "LeafDice"
+		and { Vector3.zero, Vector3.new(12, 0, 0), Vector3.new(-12, 0, 0), Vector3.new(0, 0, 12), Vector3.new(0, 0, -12) }
+		or { Vector3.zero, Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0), Vector3.new(0, 0, 3), Vector3.new(0, 0, -3) }
+	local character = player.Character
+	local rootOffset = character:GetPivot():ToObjectSpace(root.CFrame)
+	for _, offset in ipairs(offsets) do
 		if not canContinue(shouldContinue) then return false, "Cancelled." end
-		return true
-	end
-	while canContinue(shouldContinue) and os.clock() < deadline do
-		zone = AutumnTravel.findZone(zoneName)
-		if not zone then
-			stopWalking(movingHumanoid)
-			return false, "Zone not found: " .. tostring(zoneName)
-		end
-
-		local character = player.Character
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local root = character and character:FindFirstChild("HumanoidRootPart")
-		local target = positionOf(zone)
-		if humanoid and root and humanoid.Health > 0 then
-			if (root.Position - target).Magnitude <= CONFIG.ArriveDistance then
-				stopWalking(humanoid)
-				return true
+		local localPoint = Vector3.new(offset.X, 0, offset.Z)
+		if math.abs(localPoint.X) <= size.X / 2 + (margin or 0) and math.abs(localPoint.Z) <= size.Z / 2 + (margin or 0) then
+			local destination = frame * CFrame.new(localPoint)
+			local ok = pcall(function() character:PivotTo(CFrame.new(destination.Position) * (root.CFrame - root.Position) * rootOffset:Inverse()) end)
+			if ok then
+				task.wait()
+				if player.Character == character and AutumnTravel.isNearZone(zoneName, margin) then return true end
 			end
-
-			local path = PathfindingService:CreatePath()
-			local computed = pcall(function() path:ComputeAsync(root.Position, target) end)
-			local waypoints = computed and path.Status == Enum.PathStatus.Success and path:GetWaypoints() or {{ Position = target }}
-			local blockedAt, currentWaypoint = nil, 1
-			local blockedConnection = path.Blocked:Connect(function(index)
-				if index >= currentWaypoint then blockedAt = index end
-			end)
-			local replan = false
-
-			for index, waypoint in ipairs(waypoints) do
-				currentWaypoint = index
-				if not canContinue(shouldContinue) then
-					blockedConnection:Disconnect()
-					stopWalking(humanoid)
-					return false, "Cancelled."
-				end
-				if player.Character ~= character or humanoid.Health <= 0 then
-					replan = true
-					break
-				end
-				if blockedAt then
-					replan = true
-					break
-				end
-
-				if waypoint.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
-				local moved = pcall(function() humanoid:MoveTo(waypoint.Position) end)
-				if not moved then
-					blockedConnection:Disconnect()
-					stopWalking(humanoid)
-					return false, "Could not move to zone: " .. tostring(zoneName)
-				end
-				movingHumanoid = humanoid
-
-				local lastPosition, lastProgress = root.Position, os.clock()
-				while canContinue(shouldContinue) and os.clock() < deadline do
-					if player.Character ~= character or humanoid.Health <= 0 or blockedAt then
-						replan = true
-						break
-					end
-					local currentRoot = character:FindFirstChild("HumanoidRootPart")
-					if not currentRoot then
-						replan = true
-						break
-					end
-					if (currentRoot.Position - waypoint.Position).Magnitude <= 3 then break end
-					if (currentRoot.Position - lastPosition).Magnitude >= 1 then
-						lastPosition, lastProgress = currentRoot.Position, os.clock()
-					elseif os.clock() - lastProgress >= 3 then
-						local recovered, recoveryErr = recoverFromStuck(humanoid, character, deadline)
-						if not recovered then
-						blockedConnection:Disconnect()
-							stopWalking(humanoid)
-							return false, recoveryErr
-						end
-						replan = true
-						break
-					end
-					task.wait(0.2)
-				end
-				if not canContinue(shouldContinue) then
-					blockedConnection:Disconnect()
-					stopWalking(humanoid)
-					return false, "Cancelled."
-				end
-				if replan or os.clock() >= deadline then break end
-			end
-
-			blockedConnection:Disconnect()
-			if not replan then
-				local currentRoot = character:FindFirstChild("HumanoidRootPart")
-				if currentRoot and (currentRoot.Position - positionOf(zone)).Magnitude <= CONFIG.ArriveDistance then
-					stopWalking(humanoid)
-					return true
-				end
-			end
-			stopWalking(humanoid)
-			if player.Character == character and not replan then task.wait(0.2) end
 		end
 	end
-
-	stopWalking(movingHumanoid)
-	if not canContinue(shouldContinue) then return false, "Cancelled." end
-	return false, "Timed out or could not find a clear path to zone: " .. tostring(zoneName)
+	return false, "Could not verify arrival at zone: " .. tostring(zoneName)
 end
 ----------------------------------------------------------------------
 -- AUTO ROLL
@@ -521,7 +411,24 @@ local function failAndStop(id, message)
 	return false
 end
 
-local function runSetup(id)
+local function acquireRollMovement(id, owner)
+	while alive(id) do
+		if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving then
+			AutumnTravel.release(owner)
+			task.wait(0.05)
+		elseif AutumnTravel.acquire(owner, function() return alive(id) end) then
+			if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving then
+				return true
+			end
+			AutumnTravel.release(owner)
+		else
+			task.wait(0.05)
+		end
+	end
+	return false
+end
+
+local function runSetup(id, owner)
 	SetStatus("Initializing")
 	local paths = {
 		sync = { "Network", "AppleService", "RF", "Sync" },
@@ -556,21 +463,31 @@ local function runSetup(id)
 	end
 	if not sleep(id, CONFIG.StepDelay) then return nil end
 
-	-- 3. Walk to the LeafDice zone
-	SetStatus("Moving")
-	local moved, err = AutumnTravel.walkToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested end)
-	if not alive(id) then return nil end
-	if not moved then
-		return failAndStop(id, err or "Movement failed.") and nil
+	-- 3. Pivot into the LeafDice zone, yielding the movement lease to quest workers.
+	local moved, err = false, nil
+	while alive(id) do
+		if not acquireRollMovement(id, owner) then return nil end
+		SetStatus("Moving")
+		moved, err = AutumnTravel.pivotToZone("LeafDice", function()
+			return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving
+		end, 10)
+		if moved then break end
+
+		AutumnTravel.release(owner)
+		if not alive(id) then return nil end
+		if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving then
+			return failAndStop(id, err or "Movement failed.") and nil
+		end
+		task.wait(0.05)
 	end
+	if not moved or not alive(id) then return nil end
 	if not sleep(id, CONFIG.StepDelay) then return nil end
 
 	return remotes.roll
 end
 
 local function isAtLeafDice()
-	local zone, root = AutumnTravel.findZone("LeafDice"), getHRP()
-	return zone ~= nil and root ~= nil and (root.Position - zone:GetPivot().Position).Magnitude <= CONFIG.ArriveDistance
+	return AutumnTravel.isNearZone("LeafDice", 10)
 end
 
 local function rollLoop(id, rollRemote)
@@ -578,7 +495,7 @@ local function rollLoop(id, rollRemote)
 	State.Rolls = 0
 
 	while alive(id) do
-		if AutumnTravel.questRequested then
+		if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving then
 			task.wait(0.1)
 		else
 			local owner = {}
@@ -591,17 +508,17 @@ local function rollLoop(id, rollRemote)
 				local moved, err = true, nil
 				if not isAtLeafDice() then
 					SetStatus("Moving", "Returning to the LeafDice zone before rolling.")
-					moved, err = AutumnTravel.walkToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested end)
+					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving end, 10)
 				end
 				if not moved or not isAtLeafDice() then
 					AutumnTravel.release(owner)
-					if not AutumnTravel.questRequested then
+					if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving then
 						if alive(id) then failAndStop(id, err or "Could not verify arrival at LeafDice.") end
 						return
 					end
 				end
 
-				if AutumnTravel.questRequested or not alive(id) then
+				if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving or not alive(id) then
 					AutumnTravel.release(owner)
 				else
 					SetStatus("Rolling", ("Rolling Autumn Dice. Rolls completed: %d"):format(State.Rolls))
@@ -635,7 +552,7 @@ local function rollLoop(id, rollRemote)
 end
 
 local function worker(id)
-	while workerActive do
+	while workerActive or AutumnTravel.autoQuestMoving or AutumnTravel.questRequested do
 		if not alive(id) then return end
 		task.wait(0.05)
 	end
@@ -647,7 +564,7 @@ local function worker(id)
 	local setupStarted = locked
 	local ok, err = pcall(function()
 		if locked and alive(id) then
-			local rollRemote = runSetup(id)
+			local rollRemote = runSetup(id, owner)
 			AutumnTravel.rollRemote = rollRemote
 			AutumnTravel.release(owner)
 			locked = false
@@ -1286,7 +1203,6 @@ local function setAntiAfk(enabled)
 	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
 		antiAfkJump()
 		antiAfkClick()
-		print("[AutumnDice] Anti-AFK triggered: prevented disconnect after " .. tostring(timeIdled) .. " seconds.")
 	end)
 end
 
@@ -1428,6 +1344,7 @@ local function setAutoReconnect(enabled)
 	Reconnect.conns = watchDisconnect(onReconnectNeeded)
 end
 local setAutoClaim
+local setAutoQuest
 
 local function SetFeature(name, value)
 	if State.Features[name] == nil then return end
@@ -1465,6 +1382,9 @@ local function SetFeature(name, value)
 		notify()
 	elseif name == "AutoClaimQuest" then
 		setAutoClaim(value)
+		notify()
+	elseif name == "AutoQuest" then
+		if setAutoQuest then setAutoQuest(value) end
 		notify()
 	else
 		notify()
@@ -2367,8 +2287,11 @@ rollCard.Parent = eventTab.left
 rollCard.LayoutOrder = 1
 local questBody = makeCard(eventTab.right, questIcon, "Quest")
 makeToggle(questBody, 1, "Auto Claim Quest", "AutoClaimQuest")
+makeToggle(questBody, 2, "Auto Quest", "AutoQuest")
+local autoQuestStatusLabel = makeLine(questBody, 3, 11, THEME.subtext)
+autoQuestStatusLabel.Text = "Auto Quest is disabled."
 local questList = create("Frame", {
-	LayoutOrder = 2,
+	LayoutOrder = 4,
 	Size = UDim2.new(1, 0, 0, 0),
 	AutomaticSize = Enum.AutomaticSize.Y,
 	BackgroundTransparency = 1,
@@ -2633,7 +2556,7 @@ local function ensureQuestBoard(token)
 	local shouldContinue = function() return autoClaimActive(token) end
 	local arrived, err = AutumnTravel.ensureInAutumnWorld(shouldContinue)
 	if not arrived then return false, err end
-	return AutumnTravel.walkToZone("AutumnQuests", shouldContinue)
+	return AutumnTravel.pivotToZone("AutumnQuests", shouldContinue)
 end
 local function readClaimState(period)
 	local ok, raw = pcall(Quests.DataController[period.dataKey])
@@ -2749,7 +2672,7 @@ local function autoClaimWorker(token)
 						end
 
 						if State.Features.AutoDice and autoClaimEnabled(token) then
-							local returned, returnErr = AutumnTravel.walkToZone("LeafDice", function() return autoClaimEnabled(token) end)
+							local returned, returnErr = AutumnTravel.pivotToZone("LeafDice", function() return autoClaimEnabled(token) end, 10)
 							if not returned or not isAtLeafDice() then error(returnErr or "Could not verify return to LeafDice.") end
 						end
 					end)
@@ -2982,6 +2905,786 @@ task.spawn(function()
 	end
 end)
 
+local function initializeAutoQuest()
+-- AutoQuest: automatically works on every Autumn quest.
+--
+-- 1) Apple quests (apples / rare Apples / combo / Rush): walks to the Orchard
+--    and sweeps it. The game's built-in checkReach collects every apple that
+--    comes within reach, so no manual clicking is needed. Apple Rushes get
+--    top priority since they only last 90 seconds.
+-- 2) Apple Board quests: walks to the Apple Board and buys upgrade levels
+--    (spends Apples) until the quest completes.
+-- 3) Leaf Dice quests: walks to the Leaf Dice stone and rolls (spends Leaves)
+--    until the quest completes.
+-- 4) Tower quests (floors / 99-floor run): simulates full Turkey Tower runs
+--    using the player's actual tower team (health carries over between floors
+--    and team members rotate in, exactly like TowerClass.completeFloor) to
+--    pick the best tower, then auto-starts it and grinds floors until the
+--    quests complete.
+--
+-- Click the status label at the top of the screen to toggle Auto Quest.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
+
+local AppleConfig = require(ReplicatedStorage.Framework.Features.Autumn.AppleConfig)
+local TurkeyTowers = require(ReplicatedStorage.Framework.Features.Autumn.TurkeyTowers)
+local TowerRefs = require(ReplicatedStorage.Framework.Features.Towers.TowerRefs)
+local TowerController = require(ReplicatedStorage.Framework.Features.Towers.TowerController)
+local DataController = require(ReplicatedStorage.Framework.Features.Data.DataController)
+local BuffController = require(ReplicatedStorage.Framework.Features.Buffs.BuffController)
+local EntryRegistry = require(ReplicatedStorage.Framework.Features.Inventory.EntryRegistry)
+local AutumnConfig = require(ReplicatedStorage.Framework.Features.Autumn.AutumnConfig)
+local AutumnQuestConfig = require(ReplicatedStorage.Framework.Features.Autumn.AutumnQuestConfig)
+local LeafDice = require(ReplicatedStorage.Framework.Features.Autumn.LeafDice)
+local Network = require(ReplicatedStorage.Packages.Network)
+
+local player = Players.LocalPlayer
+
+-- Client entry points for Apple Board purchases and Leaf Dice rolls.
+local buyBoardUpgrade = (Network.ClientComm.new(ReplicatedStorage.Network, false, "AppleService")):GetFunction("BuyUpgrade")
+local rollLeafDice = (Network.ClientComm.new(ReplicatedStorage.Network, false, "LeafDiceService")):GetFunction("Roll")
+
+-- --------------------------------------------------------------------------
+-- Configuration
+-- --------------------------------------------------------------------------
+
+local CONFIG = {
+	AUTO_APPLES = true,        -- collect apples for apple / rare / combo / rush quests
+	AUTO_BOARD_LEVELS = true,  -- buy Apple Board levels (spends Apples)
+	AUTO_LEAF_ROLLS = true,    -- roll the Leaf Dice (spends Leaves)
+	AUTO_TOWER_RUN = true,     -- auto-run towers for floor quests
+	TOWER_PREFERENCE = "Hardest", -- "First" = easiest clearable tower, "Hardest" = best rewards
+	TOWER_START_COOLDOWN = 6,   -- seconds between start attempts (server debounce is 5)
+	WALK_TIMEOUT = 120,        -- max seconds to spend walking to a destination
+	ArriveDistance = 8,
+	BOARD_BUY_COOLDOWN = 10,   -- seconds to wait when a purchase pass buys nothing
+	DICE_RETRY_COOLDOWN = 10,  -- seconds to wait when a roll fails
+
+	RUN_FLOOR_CHECK = 100, -- simulate a full 100-floor run (leaves margin over 99)
+}
+
+-- Quest objectives handled by each activity. Quest ids, targets, and the
+-- current roll all come from AutumnQuestConfig and the player's quest data,
+-- so nothing here needs to be kept in sync by hand.
+local OBJECTIVES = {
+	APPLES = { apples = true, rareApples = true, combo = true },
+	RUSH = { rushApples = true },
+	BOARD = { boardLevels = true },
+	FLOORS = { floors = true },
+	LEAF_ROLLS = { leafRolls = true },
+	RUN_FLOOR = { runFloor = true },
+}
+
+-- --------------------------------------------------------------------------
+-- Use the host Quest card and feature toggle.
+local enabled = State.Features.AutoQuest
+local mainStatus, towerStatus = "Idle", nil
+local function refreshStatus()
+	autoQuestStatusLabel.Text = enabled and (towerStatus and (towerStatus .. " | " .. mainStatus) or mainStatus) or "Auto Quest is disabled."
+end
+local function setStatus(status)
+	mainStatus = status
+	refreshStatus()
+end
+local function setTowerStatus(status)
+	towerStatus = status
+	refreshStatus()
+end
+
+-- Quest state helpers
+-- --------------------------------------------------------------------------
+
+-- Reads the quests currently rolled for the player from the Autumn daily /
+-- hourly quest data (ids from state.quests, targets from AutumnQuestConfig).
+-- Freshly rolled quests have no progress entry yet (the server starts
+-- progress empty), so missing progress counts as 0. Claimed quests are
+-- skipped. Returns items of { objective, target, progress }.
+local function getRolledQuests()
+	local rolled = {}
+
+	for _, period in AutumnQuestConfig.Periods do
+		local ok, state = pcall(function()
+			return DataController[period.dataKey]()
+		end)
+
+		if ok and type(state) == "table" and type(state.quests) == "table" then
+			local progressMap = type(state.progress) == "table" and state.progress or {}
+			local claimedMap = type(state.claimed) == "table" and state.claimed or {}
+
+			for _, questId in state.quests do
+				local quest = AutumnQuestConfig.GetQuest(questId)
+
+				if quest and type(quest.target) == "number" then
+					local progress = math.clamp(tonumber(progressMap[questId]) or 0, 0, quest.target)
+
+					if claimedMap[questId] ~= true then
+						table.insert(rolled, {
+							objective = quest.objective,
+							target = quest.target,
+							progress = progress,
+						})
+					end
+				end
+			end
+		end
+	end
+
+	return rolled
+end
+
+-- Returns the smallest remaining count across incomplete rolled quests whose
+-- objective is in the set, or nil when there is nothing left to do.
+local function getRemaining(objectives)
+	local best = nil
+
+	for _, quest in getRolledQuests() do
+		if objectives[quest.objective] and quest.progress < quest.target then
+			local remaining = quest.target - quest.progress
+			if not best or remaining < best then
+				best = remaining
+			end
+		end
+	end
+
+	return best
+end
+
+local function getRushRemaining()
+	return getRemaining(OBJECTIVES.RUSH)
+end
+
+-- --------------------------------------------------------------------------
+-- Apple Rush detection
+-- --------------------------------------------------------------------------
+
+local function isRushActive()
+	local endsAt = workspace:GetAttribute(AppleConfig.Rush.ATTRIBUTE)
+	return type(endsAt) == "number" and workspace:GetServerTimeNow() < endsAt
+end
+
+-- --------------------------------------------------------------------------
+-- Movement
+-- --------------------------------------------------------------------------
+
+local function getCharacterParts()
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if humanoid and root and root:IsA("BasePart") then
+		return humanoid, root
+	end
+	return nil, nil
+end
+
+-- Moves the humanoid toward a position; returns true once within 4 studs
+-- or false on timeout. Aborts early when shouldStop() returns true. Always
+-- yields at least once so callers can never spin without a frame wait.
+local function moveTowards(position, timeout, shouldStop)
+	local humanoid, root = getCharacterParts()
+	if not humanoid then
+		return false
+	end
+
+	local started = os.clock()
+	humanoid:MoveTo(position)
+
+	while os.clock() - started < timeout do
+		task.wait(0.1)
+
+		if shouldStop and shouldStop() then
+			stopWalking(humanoid)
+			return false
+		end
+
+		local _, currentRoot = getCharacterParts()
+		if currentRoot and (currentRoot.Position - position).Magnitude <= 4 then
+			return true
+		end
+	end
+
+	return false
+end
+
+-- Walks to a destination using pathfinding (direct MoveTo as fallback).
+-- Returns true when arrived, false when stopped or timed out.
+local function walkTo(destination, shouldStop)
+	local deadline = os.clock() + CONFIG.WALK_TIMEOUT
+
+	while os.clock() < deadline do
+		if shouldStop and shouldStop() then
+			local currentHumanoid = getCharacterParts()
+			stopWalking(currentHumanoid)
+			return false
+		end
+
+		local humanoid, root = getCharacterParts()
+		if not humanoid or not root then
+			task.wait(0.5)
+			continue
+		end
+
+		if (root.Position - destination).Magnitude <= 10 then
+			stopWalking(humanoid)
+			return true
+		end
+
+		-- Try to compute a path; fall back to walking straight at the target.
+		local waypoints = nil
+		local path = PathfindingService:CreatePath({
+			AgentRadius = 2.5,
+			AgentHeight = 5,
+			AgentCanJump = true,
+		})
+
+		local ok = pcall(function()
+			path:ComputeAsync(root.Position, destination)
+		end)
+
+		if ok and path.Status == Enum.PathStatus.Success then
+			waypoints = path:GetWaypoints()
+		else
+			waypoints = { { Position = destination } }
+		end
+
+		for _, waypoint in waypoints do
+			if shouldStop and shouldStop() then
+				stopWalking(humanoid)
+				return false
+			end
+
+			if waypoint.Action == Enum.PathWaypointAction.Jump then
+				local humanoid2 = getCharacterParts()
+				if humanoid2 then
+					humanoid2.Jump = true
+				end
+			end
+
+			-- If a waypoint stalls, break out and recompute the path.
+			if not moveTowards(waypoint.Position, 4, shouldStop) then
+				break
+			end
+		end
+	end
+
+	local currentHumanoid = getCharacterParts()
+	stopWalking(currentHumanoid)
+	return false
+end
+
+-- --------------------------------------------------------------------------
+-- Apple Rush auto-collect
+-- --------------------------------------------------------------------------
+
+-- Nearest visible apple position (apple visuals live in workspace.AutumnApples).
+local function getNearestApplePosition(fromPosition)
+	local folder = workspace:FindFirstChild("AutumnApples")
+	if not folder then
+		return nil
+	end
+
+	local bestPosition = nil
+	local bestDistance = nil
+
+	for _, child in folder:GetChildren() do
+		if child:IsA("Model") then
+			local ok, position = pcall(function()
+				return child:GetPivot().Position
+			end)
+
+			if ok and position then
+				local distance = (position - fromPosition).Magnitude
+				if not bestDistance or distance < bestDistance then
+					bestDistance = distance
+					bestPosition = position
+				end
+			end
+		end
+	end
+
+	return bestPosition
+end
+
+-- Keeps collecting while a rush is running with rush quests left, or while
+-- any regular apple quest (apples / rare / combo) is incomplete.
+local function shouldStopApples()
+	if not enabled or AutumnTravel.questRequested then
+		return true
+	end
+
+	if isRushActive() and getRushRemaining() then
+		return false
+	end
+
+	if CONFIG.AUTO_APPLES and getRemaining(OBJECTIVES.APPLES) then
+		return false
+	end
+
+	return true
+end
+
+-- Sweeps the Orchard chasing the nearest apple; the game's checkReach
+-- collects apples automatically as they enter reach. Always yields at
+-- least once per iteration so the loop can never starve the frame.
+local function chaseApples()
+	while not shouldStopApples() do
+		task.wait(0.15)
+
+		local humanoid, root = getCharacterParts()
+		if not humanoid or not root then
+			continue
+		end
+
+		local applePosition = getNearestApplePosition(root.Position)
+		if applePosition then
+			-- A short hop per apple keeps the loop responsive without spamming
+			-- MoveTo every frame; checkReach collects apples near the character.
+			moveTowards(applePosition, 1, shouldStopApples)
+		end
+	end
+end
+
+-- --------------------------------------------------------------------------
+-- Activity: collect apples (rush + apple / rare / combo quests)
+-- --------------------------------------------------------------------------
+
+local function collectApplesActivity()
+	-- Pivot to the Orchard, then walk while collecting apples.
+	if AutumnTravel.findZone(AppleConfig.AREA_ZONE) then
+		AutumnTravel.pivotToZone(AppleConfig.AREA_ZONE, function()
+			return shouldStopApples()
+		end)
+	end
+
+	-- Sweep the Orchard until every apple quest completes.
+	if not shouldStopApples() then
+		chaseApples()
+	end
+end
+
+-- --------------------------------------------------------------------------
+-- Activity: buy Apple Board levels (spends Apples)
+-- --------------------------------------------------------------------------
+
+local function buyBoardLevelsActivity()
+	if AutumnTravel.findZone(AppleConfig.AREA_ZONE) then
+		setStatus("Board: walking to the Apple Board")
+		AutumnTravel.pivotToZone(AppleConfig.AREA_ZONE, function()
+			return not enabled or AutumnTravel.questRequested or not getRemaining(OBJECTIVES.BOARD)
+		end)
+	end
+
+	while enabled and not AutumnTravel.questRequested and CONFIG.AUTO_BOARD_LEVELS and getRemaining(OBJECTIVES.BOARD) do
+		local boughtAny = false
+
+		-- Try every upgrade; the server validates unlocks, caps, and cost.
+		-- Passing true buys as many levels as the player can afford at once.
+		for _, upgrade in AppleConfig.Upgrades do
+			if not getRemaining(OBJECTIVES.BOARD) then
+				break
+			end
+
+			local ok, bought = pcall(buyBoardUpgrade, upgrade.name, true)
+			if ok and bought then
+				boughtAny = true
+			end
+
+			task.wait(0.1)
+		end
+
+		if boughtAny then
+			setStatus("Board: buying levels")
+			task.wait(0.2)
+		else
+			-- Out of Apples (or everything maxed): wait and retry later.
+			setStatus("Board: waiting for Apples")
+			task.wait(CONFIG.BOARD_BUY_COOLDOWN)
+		end
+	end
+end
+
+-- --------------------------------------------------------------------------
+-- Activity: roll the Leaf Dice (spends Leaves)
+-- --------------------------------------------------------------------------
+
+local function rollLeafDiceActivity()
+	local shouldContinue = function()
+		return enabled and not AutumnTravel.questRequested and getRemaining(OBJECTIVES.LEAF_ROLLS) ~= nil
+	end
+	local function ensureLeafDicePosition()
+		if not shouldContinue() then return false end
+		local traveled, travelErr = AutumnTravel.ensureInAutumnWorld(shouldContinue)
+		if not traveled then
+			setStatus("Dice: could not enter Autumn World")
+			warn("[AutumnDice] Auto Quest dice travel failed: " .. tostring(travelErr))
+			return false
+		end
+		if not AutumnTravel.isNearZone(AutumnConfig.Zones.LeafDice, 10) then
+			setStatus("Dice: moving to the Leaf Dice")
+			local arrived, moveErr = AutumnTravel.pivotToZone(AutumnConfig.Zones.LeafDice, shouldContinue, 10)
+			if not arrived then
+				setStatus("Dice: could not reach the Leaf Dice")
+				warn("[AutumnDice] Auto Quest dice movement failed: " .. tostring(moveErr))
+				return false
+			end
+		end
+		return AutumnTravel.isNearZone(AutumnConfig.Zones.LeafDice, 10)
+	end
+
+	while enabled and not AutumnTravel.questRequested and CONFIG.AUTO_LEAF_ROLLS and getRemaining(OBJECTIVES.LEAF_ROLLS) do
+		-- Recheck immediately before each event; never roll outside the validated box.
+		if not ensureLeafDicePosition() then
+			if not shouldContinue() then break end
+			task.wait(1)
+			continue
+		end
+
+		-- Multi rolls count as MULTI rolls toward the quest; fall back to a
+		-- single roll when storage or Leaves only allow one at a time.
+		local ok, results = pcall(rollLeafDice, LeafDice.MULTI)
+		local rolled = ok and type(results) == "table" and #results > 0
+
+		if not rolled and ensureLeafDicePosition() then
+			ok, results = pcall(rollLeafDice, 1)
+			rolled = ok and type(results) == "table" and #results > 0
+		end
+
+		if rolled then
+			setStatus("Dice: rolling")
+			task.wait(LeafDice.ROLL_DURATION + 0.1)
+		else
+			-- Out of Leaves or unit storage: wait and retry later.
+			setStatus("Dice: waiting for Leaves")
+			task.wait(CONFIG.DICE_RETRY_COOLDOWN)
+		end
+	end
+end
+
+-- --------------------------------------------------------------------------
+local function runQuestActivity(activity, zoneName, alwaysMove)
+	local _, root = getCharacterParts()
+	local zone = AutumnTravel.findZone(zoneName)
+	local destination = zone and zone:GetPivot().Position
+	local needsMovement = alwaysMove or (zoneName == AutumnConfig.Zones.LeafDice and not AutumnTravel.isNearZone(zoneName, 10))
+		or (destination and (not root or (root.Position - destination).Magnitude > CONFIG.ArriveDistance))
+
+	if not needsMovement then
+		local ok, err = pcall(activity)
+		if not ok then warn("[AutumnDice] Auto Quest activity failed: " .. tostring(err)) end
+		return
+	end
+
+	AutumnTravel.autoQuestMoving = true
+	local owner = {}
+	if AutumnTravel.acquire(owner, function() return enabled and not AutumnTravel.questRequested end) then
+		local ok, err = pcall(activity)
+		AutumnTravel.release(owner)
+		if not ok then warn("[AutumnDice] Auto Quest activity failed: " .. tostring(err)) end
+	end
+	AutumnTravel.autoQuestMoving = false
+end
+
+-- Master scheduler
+-- --------------------------------------------------------------------------
+
+-- Picks the next activity by priority: Apple Rushes are time limited, the
+-- board and dice quests finish quickly, and apple picking is the long grind.
+task.spawn(function()
+	while true do
+		task.wait(1)
+
+		if not enabled or AutumnTravel.questRequested then
+			continue
+		end
+
+		if isRushActive() and getRushRemaining() then
+			local remaining = getRushRemaining()
+			setStatus(("Rush: %d apples to go"):format(remaining))
+			runQuestActivity(collectApplesActivity, AppleConfig.AREA_ZONE, true)
+		elseif CONFIG.AUTO_BOARD_LEVELS and getRemaining(OBJECTIVES.BOARD) then
+			runQuestActivity(buyBoardLevelsActivity, AppleConfig.AREA_ZONE)
+		elseif CONFIG.AUTO_LEAF_ROLLS and getRemaining(OBJECTIVES.LEAF_ROLLS) then
+			runQuestActivity(rollLeafDiceActivity, AutumnConfig.Zones.LeafDice)
+		elseif CONFIG.AUTO_APPLES and getRemaining(OBJECTIVES.APPLES) then
+			setStatus("Apples: collecting in the Orchard")
+			runQuestActivity(collectApplesActivity, AppleConfig.AREA_ZONE, true)
+		else
+			setStatus("Idle")
+		end
+	end
+end)
+
+-- --------------------------------------------------------------------------
+-- Tower team and full-run simulation (mirrors TowerClass)
+-- --------------------------------------------------------------------------
+
+local function getBuff(name)
+	local ok, value = pcall(function()
+		return BuffController.GetBuff(name)
+	end)
+	if ok and type(value) == "number" then
+		return value
+	end
+	return 1
+end
+
+-- Builds the player's tower team with effective (buffed) stats, mirroring
+-- TowerClass.new. Returns an array of { name, damage, health }.
+local function getTeam()
+	local team = {}
+
+	for index = 1, TowerRefs.MAX_TEAM_SIZE do
+		local ok, key = pcall(function()
+			return DataController.TowerTeam[index]()
+		end)
+
+		if ok and type(key) == "string" then
+			local okEntry, entry = pcall(function()
+				return DataController.Inventory[key]()
+			end)
+
+			if okEntry and type(entry) == "table" then
+				local config = EntryRegistry.getEntryConfig(entry.name)
+
+				if config and config.kind == "Unit" then
+					local damage = config.damage(entry.attributes)
+					local health = config.health(entry.attributes)
+
+					if type(damage) == "number" and type(health) == "number" then
+						table.insert(team, {
+							name = entry.name,
+							damage = damage * getBuff("Damage Multiplier"),
+							health = health * getBuff("Health Multiplier"),
+						})
+					end
+				end
+			end
+		end
+	end
+
+	return team
+end
+
+local function getMilestones()
+	local ok, result = pcall(function()
+		return DataController.Autumn.Milestones()
+	end)
+	if ok and type(result) == "table" then
+		return result
+	end
+	return nil
+end
+
+-- Simulates one full tower run using the game's combat rules:
+--   * the active unit strikes first; the enemy retaliates while alive
+--   * unit health carries over between floors (no healing between floors)
+--   * when a unit dies the next team member takes over mid-fight
+-- Returns the number of floors cleared in a single run.
+local function simulateRun(section, maxFloors, team)
+	-- Copy the team so repeated simulations don't mutate the original stats.
+	local members = {}
+	for _, member in team do
+		table.insert(members, { damage = member.damage, health = member.health })
+	end
+
+	local currentMember = 1
+
+	for floor = 1, maxFloors do
+		local okHealth, enemyHealth = pcall(TurkeyTowers.EnemyHealth, section, floor)
+		local okDamage, enemyDamage = pcall(TurkeyTowers.EnemyDamage, section, floor)
+
+		if not okHealth or not okDamage
+			or type(enemyHealth) ~= "number"
+			or type(enemyDamage) ~= "number" then
+			return floor - 1
+		end
+
+		local floorCleared = false
+
+		while currentMember <= #members do
+			local member = members[currentMember]
+
+			if member.damage <= 0 then
+				-- This member can never kill the enemy; it dies contributing nothing.
+				currentMember += 1
+				continue
+			end
+
+			if enemyDamage <= 0 then
+				-- Enemy cannot fight back: the member clears the floor untouched.
+				floorCleared = true
+				break
+			end
+
+			-- Attacks the member makes before dying (it always strikes first).
+			local attacksBeforeDying = math.ceil(member.health / enemyDamage)
+			-- Attacks needed to bring the enemy down.
+			local attacksNeeded = math.ceil(enemyHealth / member.damage)
+
+			if attacksNeeded <= attacksBeforeDying then
+				-- Member survives the floor; only hit on turns the enemy lived.
+				member.health -= (attacksNeeded - 1) * enemyDamage
+				floorCleared = true
+				break
+			end
+
+			-- Member dies on this floor after dealing its attacks' worth of damage.
+			enemyHealth -= attacksBeforeDying * member.damage
+			currentMember += 1
+		end
+
+		if not floorCleared then
+			return floor - 1
+		end
+	end
+
+	return maxFloors
+end
+
+-- Finds the best tower section to run.
+-- When requireFullRun is true, only a section that can clear the full
+-- run-floor quest target counts (used for the 99-floor quest). Otherwise the
+-- section with the deepest simulated clear is returned so the cumulative
+-- floor quests can be grinded. Returns the section, or nil + info string.
+-- Target of the single-run floor quest (e.g. "clear 99 floors in one run").
+local function getRunFloorTarget()
+	for _, period in AutumnQuestConfig.Periods do
+		for _, quest in period.quests do
+			if quest.objective == "runFloor" then
+				return quest.target
+			end
+		end
+	end
+
+	return nil
+end
+
+local function findBestSection(requireFullRun)
+	local runTarget = getRunFloorTarget()
+	local milestones = getMilestones()
+	if not milestones then
+		return nil, "data unavailable"
+	end
+
+	local team = getTeam()
+	if #team == 0 then
+		return nil, "no units"
+	end
+
+	local candidate = nil
+	local bestSimulation = { section = nil, floors = 0 }
+
+	for index, section in TurkeyTowers.Sections do
+		local ok, unlocked = pcall(TurkeyTowers.IsUnlocked, milestones, index)
+		if ok and unlocked then
+			local floors = simulateRun(section, CONFIG.RUN_FLOOR_CHECK, team)
+
+			if floors > bestSimulation.floors then
+				bestSimulation.floors = floors
+				bestSimulation.section = section
+			end
+
+			if runTarget and floors >= runTarget then
+				candidate = section
+				if CONFIG.TOWER_PREFERENCE == "First" then
+					break
+				end
+			end
+		end
+	end
+
+	if candidate then
+		return candidate, nil
+	end
+
+	if not requireFullRun and bestSimulation.section then
+		return bestSimulation.section, nil
+	end
+
+	if bestSimulation.section then
+		return nil, ("best is %s at %d floors"):format(bestSimulation.section.name, bestSimulation.floors)
+	end
+
+	return nil, "no towers unlocked"
+end
+
+-- --------------------------------------------------------------------------
+-- Tower auto-run
+-- --------------------------------------------------------------------------
+
+local lastTowerAttempt = 0
+
+local function isTowerRunActive()
+	local playerGui = player:FindFirstChild("PlayerGui")
+	local root = playerGui and playerGui:FindFirstChild("Root")
+	local tower = root and root:FindFirstChild("Tower")
+	local screen = tower and tower:FindFirstChild("Screen")
+	return screen ~= nil and screen.Visible
+end
+
+local function tryStartTower(section)
+	local now = os.clock()
+
+	if now - lastTowerAttempt < CONFIG.TOWER_START_COOLDOWN then
+		return false
+	end
+	lastTowerAttempt = now
+
+	local ok, result = pcall(TowerController.startTower, section.name)
+	return ok and result == true
+end
+
+-- Watches the floor quests and auto-runs towers until they complete.
+task.spawn(function()
+	while true do
+		task.wait(1)
+
+		if not enabled or not CONFIG.AUTO_TOWER_RUN then
+			continue
+		end
+
+		local runFloorRemaining = getRemaining(OBJECTIVES.RUN_FLOOR)
+		local floorsRemaining = getRemaining(OBJECTIVES.FLOORS)
+
+		if not runFloorRemaining and not floorsRemaining then
+			continue
+		end
+
+		if isTowerRunActive() then
+			setTowerStatus("Tower: run in progress")
+			continue
+		end
+
+		-- Prefer a tower that can clear the 99-floor quest in one run;
+		-- otherwise grind the deepest tower for the cumulative floor quests.
+		local section, reason = nil, nil
+
+		if runFloorRemaining then
+			section, reason = findBestSection(true)
+		end
+
+		if not section and floorsRemaining then
+			section, reason = findBestSection(false)
+		end
+
+		if section then
+			if tryStartTower(section) then
+				setTowerStatus(("Tower: running %s"):format(section.name))
+			end
+		else
+			setTowerStatus(("Tower: waiting (%s)"):format(reason or "none"))
+		end
+	end
+end)
+
+setAutoQuest = function(value)
+	enabled = value
+	setStatus(value and "Preparing Autumn quests" or "Disabled")
+end
+
+end
+
 ----------------------------------------------------------------------
 -- Unload / public API
 ----------------------------------------------------------------------
@@ -2992,6 +3695,8 @@ local function Unload()
 	uninstallFloorHook()
 	unhookQuests()
 	setAutoClaim(false)
+	setAutoQuest(false)
+	State.Features.AutoQuest = false
 	State.Features.AutoClaimQuest = false
 	State.Features.AutoDice = false
 	State.Features.AutoTower = false
@@ -3023,3 +3728,5 @@ env.AutumnDice = {
 for _, name in ipairs({ "AntiAfk", "AutoReconnect", "AutoDice" }) do
 	SetFeature(name, true)
 end
+
+initializeAutoQuest()
