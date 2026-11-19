@@ -362,6 +362,34 @@ function AutumnTravel.walkToZone(zoneName, shouldContinue)
 
 	local deadline = os.clock() + 30
 	local movingHumanoid
+	local recoveryCount = 0
+	local function recoverFromStuck(humanoid, character, deadline)
+		recoveryCount += 1
+		local side = recoveryCount % 2 == 1 and 1 or -1
+		for _, direction in ipairs({ "back", "side" }) do
+			if not canContinue(shouldContinue) then return false, "Cancelled." end
+			if player.Character ~= character or humanoid.Health <= 0 then return true end
+			local root = character:FindFirstChild("HumanoidRootPart")
+			if not root then return true end
+			local forward = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+			local right = Vector3.new(root.CFrame.RightVector.X, 0, root.CFrame.RightVector.Z)
+			if forward.Magnitude < 0.01 or right.Magnitude < 0.01 then return true end
+			local offset = direction == "back" and -forward.Unit * 3.5 or right.Unit * side * 4
+			local destination = root.Position + offset
+			if pcall(function() humanoid:MoveTo(destination) end) then
+				local attemptDeadline = math.min(deadline, os.clock() + 1.25)
+				while canContinue(shouldContinue) and os.clock() < attemptDeadline do
+					if player.Character ~= character or humanoid.Health <= 0 then return true end
+					root = character:FindFirstChild("HumanoidRootPart")
+					if not root or (root.Position - destination).Magnitude <= 2 then break end
+					task.wait(0.1)
+				end
+			end
+		end
+		stopWalking(humanoid)
+		if not canContinue(shouldContinue) then return false, "Cancelled." end
+		return true
+	end
 	while canContinue(shouldContinue) and os.clock() < deadline do
 		zone = AutumnTravel.findZone(zoneName)
 		if not zone then
@@ -428,6 +456,12 @@ function AutumnTravel.walkToZone(zoneName, shouldContinue)
 					if (currentRoot.Position - lastPosition).Magnitude >= 1 then
 						lastPosition, lastProgress = currentRoot.Position, os.clock()
 					elseif os.clock() - lastProgress >= 3 then
+						local recovered, recoveryErr = recoverFromStuck(humanoid, character, deadline)
+						if not recovered then
+						blockedConnection:Disconnect()
+							stopWalking(humanoid)
+							return false, recoveryErr
+						end
 						replan = true
 						break
 					end
@@ -1177,46 +1211,82 @@ end
 ----------------------------------------------------------------------
 ----------------------------------------------------------------------
 -- ANTI AFK
--- Event driven: Roblox fires Player.Idled after ~2 minutes without input, and
--- VirtualUser input resets the idle timer. While disabled there is no connection
--- and no loop, so it costs nothing.
+-- 1) Disables the game's own idle-rejoin timer (the AFK LocalScript reads the
+--    "AFKRejoinEnabled" player attribute; false cancels its pending rejoin).
+-- 2) Answers Roblox's ~20 minute idle kick: Player.Idled fires, and we respond
+--    with a jump plus a VirtualUser click so the idle timer resets.
+-- While disabled there is no connection and the game's attribute is restored.
 ----------------------------------------------------------------------
-local AntiAfk = { conn = nil }
+local AntiAfk = { conn = nil, attrConn = nil, prevAttr = nil, savedAttr = false }
+
+local function antiAfkJump()
+	pcall(function()
+		local lp = Players.LocalPlayer
+		local char = lp and lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health > 0 then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end)
+end
+
+local function antiAfkClick()
+	pcall(function()
+		local VirtualUser = game:GetService("VirtualUser")
+		local camera = workspace.CurrentCamera
+		local cf = camera and camera.CFrame or CFrame.new()
+		VirtualUser:CaptureController()
+		VirtualUser:Button2Down(Vector2.new(0, 0), cf)
+		task.wait(0.5)
+		VirtualUser:Button2Up(Vector2.new(0, 0), cf)
+	end)
+end
 
 local function setAntiAfk(enabled)
+	local lp = Players.LocalPlayer
 	if not enabled then
 		if AntiAfk.conn then
 			AntiAfk.conn:Disconnect()
 			AntiAfk.conn = nil
 		end
+		if AntiAfk.attrConn then
+			AntiAfk.attrConn:Disconnect()
+			AntiAfk.attrConn = nil
+		end
+		-- hand the game's own rejoin timer back
+		if AntiAfk.savedAttr and lp then
+			pcall(function() lp:SetAttribute("AFKRejoinEnabled", AntiAfk.prevAttr) end)
+		end
+		AntiAfk.savedAttr = false
 		return
 	end
 	if AntiAfk.conn then return end
 
-	local ok, VirtualUser = pcall(function() return game:GetService("VirtualUser") end)
-	if not ok or not VirtualUser then
-		warn("[AutumnDice] Anti AFK unavailable: VirtualUser service not found")
-		State.Features.AntiAfk = false -- keep the toggle truthful
-		return
-	end
-
-	local lp = Players.LocalPlayer
 	if not lp then
 		warn("[AutumnDice] Anti AFK unavailable: LocalPlayer not ready")
 		State.Features.AntiAfk = false -- keep the toggle truthful
 		return
 	end
 
-	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
-		-- simulate a right-click hold to reset the internal idle timer
-		pcall(function()
-			local camera = workspace.CurrentCamera
-			local cf = camera and camera.CFrame or CFrame.new()
-			VirtualUser:Button2Down(Vector2.new(0, 0), cf)
-			task.wait(1)
-			VirtualUser:Button2Up(Vector2.new(0, 0), cf)
-			print("[AutumnDice] Anti-AFK triggered: prevented disconnect after " .. tostring(timeIdled) .. " seconds.")
+	-- disable the game's own idle-rejoin timer and keep it disabled
+	pcall(function()
+		if not AntiAfk.savedAttr then
+			AntiAfk.prevAttr = lp:GetAttribute("AFKRejoinEnabled")
+			AntiAfk.savedAttr = true
+		end
+		lp:SetAttribute("AFKRejoinEnabled", false)
+		AntiAfk.attrConn = lp:GetAttributeChangedSignal("AFKRejoinEnabled"):Connect(function()
+			if lp:GetAttribute("AFKRejoinEnabled") ~= false then
+				lp:SetAttribute("AFKRejoinEnabled", false)
+			end
 		end)
+	end)
+
+	-- answer the idle kick with a jump and a click
+	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
+		antiAfkJump()
+		antiAfkClick()
+		print("[AutumnDice] Anti-AFK triggered: prevented disconnect after " .. tostring(timeIdled) .. " seconds.")
 	end)
 end
 
