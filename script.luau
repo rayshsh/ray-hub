@@ -1136,17 +1136,6 @@ end
 ----------------------------------------------------------------------
 local AntiAfk = { conn = nil, attrConn = nil, prevAttr = nil, savedAttr = false }
 
-local function antiAfkJump()
-	pcall(function()
-		local lp = Players.LocalPlayer
-		local char = lp and lp.Character
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if hum and hum.Health > 0 then
-			hum:ChangeState(Enum.HumanoidStateType.Jumping)
-		end
-	end)
-end
-
 local function antiAfkClick()
 	pcall(function()
 		local VirtualUser = game:GetService("VirtualUser")
@@ -1201,7 +1190,6 @@ local function setAntiAfk(enabled)
 
 	-- answer the idle kick with a jump and a click
 	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
-		antiAfkJump()
 		antiAfkClick()
 	end)
 end
