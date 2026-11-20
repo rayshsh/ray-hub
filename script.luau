@@ -4,6 +4,8 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
 
 ----------------------------------------------------------------------
 -- Startup gate: do NOTHING until the game has fully loaded.
@@ -90,7 +92,7 @@ local TOWER_MODES = { "Single", "Best Leaf Tower" }
 ----------------------------------------------------------------------
 local State = {
 	Features = {
-		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false, AutoBuy = false,
+		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false, AutoBuy = false, FloatingButton = true,
 		-- Miscellaneous
 		AntiAfk = false, AutoReconnect = false, AutoClaimQuest = false,
 	},
@@ -354,7 +356,7 @@ function AutumnTravel.ensureInAutumnWorld(shouldContinue)
 	if not AutumnTravel.isInAutumnWorld() then return finish(false, "Timed out waiting for Autumn World.") end
 	return finish(true)
 end
-function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
+function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin, destinationOffset)
     local zone = AutumnTravel.findZone(zoneName)
     if not zone then return false, "Zone not found: " .. tostring(zoneName) end
     local root = getHRP(15)
@@ -364,6 +366,7 @@ function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
     local offsets = zoneName == "LeafDice"
         and { Vector3.zero, Vector3.new(12, 0, 0), Vector3.new(-12, 0, 0), Vector3.new(0, 0, 12), Vector3.new(0, 0, -12) }
         or { Vector3.zero, Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0), Vector3.new(0, 0, 3), Vector3.new(0, 0, -3) }
+    if destinationOffset then table.insert(offsets, 1, destinationOffset) end
     local character = player.Character
     local rootOffset = character:GetPivot():ToObjectSpace(root.CFrame)
     for _, offset in ipairs(offsets) do
@@ -472,7 +475,7 @@ local function runSetup(id, owner)
 		SetStatus("Moving")
 		moved, err = AutumnTravel.pivotToZone("LeafDice", function()
 			return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested
-		end, 10)
+		end, 10, Vector3.new(12, 0, 0))
 		if moved then break end
 
 		AutumnTravel.release(owner)
@@ -510,7 +513,7 @@ local function rollLoop(id, rollRemote)
 				local moved, err = true, nil
 				if not isAtLeafDice() then
 					SetStatus("Moving", "Returning to the LeafDice zone before rolling.")
-					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested end, 10)
+					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested end, 10, Vector3.new(12, 0, 0))
 				end
 				if not moved or not isAtLeafDice() then
 					AutumnTravel.release(owner)
@@ -1204,6 +1207,7 @@ local function setAutoReconnect(enabled)
 	-- intentionally empty: no connections, no saved server, no teleports
 end
 local setAutoClaim
+local floatingButton
 local AutoBuy = {} -- filled in by the Auto Buy section (Event tab)
 local setAutoQuest
 
@@ -1249,6 +1253,9 @@ local function SetFeature(name, value)
 		notify()
 	elseif name == "AutoBuy" then
 		if AutoBuy.setEnabled then AutoBuy.setEnabled(value) end
+		notify()
+	elseif name == "FloatingButton" then
+		if floatingButton then floatingButton.Visible = value end
 		notify()
 	else
 		notify()
@@ -1535,10 +1542,10 @@ catcher.MouseButton1Click:Connect(closeDropdowns)
 -- Layout: side navigation (left) + one page per tab (right) ----------------
 local SIDEBAR_GAP = 8
 
--- fills the space between the title bar (top) and the footer (bottom)
+-- fills the space below the title bar
 local bodyRow = create("Frame", {
 	Position = UDim2.fromOffset(0, 26),
-	Size = UDim2.new(1, 0, 1, -52),
+	Size = UDim2.new(1, 0, 1, -32),
 	BackgroundTransparency = 1,
 	Parent = main,
 })
@@ -2435,7 +2442,129 @@ end, "Miscellaneous")
 
 makeToggle(miscBody, 1, "Anti AFK", "AntiAfk")
 makeToggle(miscBody, 2, "Auto Reconnect", "AutoReconnect")
+makeToggle(miscBody, 3, "Floating GUI Button", "FloatingButton")
 
+local teleportPending = false
+local visitedServers = {}
+local rejoinButton, serverHopButton
+
+local function teleportToInstance(jobId, label)
+	if teleportPending then return false end
+	if game.PlaceId <= 0 or type(jobId) ~= "string" or jobId == "" then
+		warn(label .. " failed: this server has no valid instance ID.")
+		return false
+	end
+	teleportPending = true
+	local ok, err = pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, player)
+	end)
+	if not ok then
+		teleportPending = false
+		warn(label .. " failed: " .. tostring(err))
+		return false
+	end
+	return true
+end
+
+local function RejoinServer()
+	if game.JobId == "" then
+		warn("Rejoin failed: the current server has no Job ID.")
+		return false
+	end
+	return teleportToInstance(game.JobId, "Rejoin")
+end
+
+local function ServerHop()
+	if teleportPending then return false end
+	local httpRequest = (syn and syn.request) or http_request or request
+	if type(httpRequest) ~= "function" then
+		warn("Server Hop failed: this environment does not provide an HTTP request function.")
+		return false
+	end
+	teleportPending = true
+	task.spawn(function()
+		local ok, result = pcall(function()
+			local cursor, candidates = "", {}
+			for _ = 1, 5 do
+				local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true%s")
+					:format(game.PlaceId, cursor ~= "" and "&cursor=" .. HttpService:UrlEncode(cursor) or "")
+				local response = httpRequest({ Url = url, Method = "GET" })
+				local status = tonumber(response.StatusCode or response.Status or response.status_code)
+				if response.Success == false or (status and status ~= 200) then
+					error("server list request returned " .. tostring(status or "an error"))
+				end
+				local page = HttpService:JSONDecode(response.Body or response.body or "")
+				for _, server in ipairs(page.data or {}) do
+					if server.id ~= game.JobId and (server.playing or 0) < (server.maxPlayers or 0) then
+						table.insert(candidates, server.id)
+					end
+				end
+				cursor = page.nextPageCursor or ""
+				if #candidates > 0 or cursor == "" then break end
+			end
+			local fresh = {}
+			for _, id in ipairs(candidates) do
+				if not visitedServers[id] then table.insert(fresh, id) end
+			end
+			local pool = #fresh > 0 and fresh or candidates
+			if #pool == 0 then error("no other available public servers were found") end
+			local jobId = pool[math.random(1, #pool)]
+			visitedServers[jobId] = true
+			return jobId
+		end)
+		if not ok then
+			teleportPending = false
+			warn("Server Hop failed: " .. tostring(result))
+			return
+		end
+		local started, err = pcall(function()
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, result, player)
+		end)
+		if not started then
+			teleportPending = false
+			warn("Server Hop failed: " .. tostring(err))
+		end
+	end)
+	return true
+end
+
+table.insert(connections, TeleportService.TeleportInitFailed:Connect(function(failedPlayer, result, message)
+	if failedPlayer == player then
+		teleportPending = false
+		warn(("Teleport failed (%s): %s"):format(tostring(result), tostring(message)))
+	end
+end))
+
+local teleportButtonsRow = create("Frame", {
+	LayoutOrder = 5,
+	Size = UDim2.new(1, 0, 0, 28),
+	BackgroundTransparency = 1,
+	Parent = miscBody,
+}, { create("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	Padding = UDim.new(0, 8),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}) })
+
+local function makeTeleportButton(order, label, callback)
+	local button = create("TextButton", {
+		LayoutOrder = order,
+		Size = UDim2.new(0.5, -4, 0, 28),
+		BackgroundColor3 = THEME.field,
+		BorderSizePixel = 0,
+		Text = label,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextColor3 = THEME.text,
+		AutoButtonColor = false,
+		Parent = teleportButtonsRow,
+	}, { corner(8), stroke(THEME.stroke) })
+	button.MouseButton1Click:Connect(callback)
+	return button
+end
+
+rejoinButton = makeTeleportButton(1, "Rejoin", RejoinServer)
+serverHopButton = makeTeleportButton(2, "Server Hop", ServerHop)
 ----------------------------------------------------------------------
 -- Tab: Event -> Quest card (local player's Autumn quests, Daily + Hourly)
 -- Data comes from DataController[period.dataKey]() and AutumnQuestConfig, the same way the
@@ -3260,67 +3389,154 @@ refreshColumns()
 selectTab("Roll")
 
 ----------------------------------------------------------------------
--- Footer: hotkey
-----------------------------------------------------------------------
+-- GUI visibility controls ---------------------------------------------------
 local hotkeyRow = create("Frame", {
-	Position = UDim2.new(0, 0, 1, -22),
-	Size = UDim2.new(1, 0, 0, 22),
-	BackgroundTransparency = 1,
-	Parent = main,
-}, { pad(2, 0, 2, 0) })
+    LayoutOrder = 4,
+    Size = UDim2.new(1, 0, 0, 22),
+    BackgroundTransparency = 1,
+    Parent = miscBody,
+}, { pad(2, 2, 2, 2) })
 create("TextLabel", {
-	Size = UDim2.new(0.5, 0, 1, 0),
-	BackgroundTransparency = 1,
-	Text = "Show / hide GUI",
-	Font = Enum.Font.Gotham,
-	TextSize = 11,
-	TextColor3 = THEME.subtext,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	Parent = hotkeyRow,
+    Size = UDim2.new(0.5, 0, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "Show / hide GUI",
+    Font = Enum.Font.GothamMedium,
+    TextSize = 13,
+    TextColor3 = THEME.text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = hotkeyRow,
 })
 local hotkeyBtn = create("TextButton", {
-	Size = UDim2.fromOffset(104, 20),
-	Position = UDim2.new(1, -104, 0.5, -10),
-	BackgroundColor3 = THEME.field,
-	Text = "",
-	Font = Enum.Font.GothamBold,
-	TextSize = 11,
-	TextColor3 = THEME.accent,
-	AutoButtonColor = false,
-	Parent = hotkeyRow,
+    Size = UDim2.fromOffset(104, 20),
+    Position = UDim2.new(1, -104, 0.5, -10),
+    BackgroundColor3 = THEME.field,
+    Text = "",
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextColor3 = THEME.accent,
+    AutoButtonColor = false,
+    Parent = hotkeyRow,
 }, { corner(8), stroke(THEME.stroke) })
+
+local function setMainVisible(visible)
+    main.Visible = visible
+    if not visible then closeDropdowns() end
+end
+
+local function toggleMainVisibility()
+    setMainVisible(not main.Visible)
+end
+
+floatingButton = create("TextButton", {
+    Name = "FloatingGuiToggle",
+    AnchorPoint = Vector2.zero,
+    Position = UDim2.new(0.5, -21, 0.15, 0),
+    Size = UDim2.fromOffset(42, 42),
+    BackgroundColor3 = THEME.card,
+    BorderSizePixel = 0,
+    Text = "◉",
+    Font = Enum.Font.GothamBold,
+    TextSize = 22,
+    TextColor3 = THEME.accent,
+    AutoButtonColor = false,
+    Active = true,
+    Visible = State.Features.FloatingButton,
+    ZIndex = 50,
+    Parent = gui,
+}, { corner(21), stroke(THEME.stroke) })
+
+local function clampFloatingButton(position)
+    local cam = workspace.CurrentCamera
+    local viewport = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    local current = position or floatingButton.AbsolutePosition
+    local maxX = math.max(0, viewport.X - floatingButton.AbsoluteSize.X)
+    local maxY = math.max(0, viewport.Y - floatingButton.AbsoluteSize.Y)
+    floatingButton.Position = UDim2.fromOffset(math.clamp(current.X, 0, maxX), math.clamp(current.Y, 0, maxY))
+end
+
+do
+    local pointerDown, dragging = false, false
+    local pointerType, touchInput = nil, nil
+    local startInput = nil
+
+    table.insert(connections, floatingButton.InputBegan:Connect(function(input)
+        if pointerDown or (input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch) then
+            return
+        end
+        pointerDown = true
+        dragging = false
+        pointerType = input.UserInputType
+        touchInput = pointerType == Enum.UserInputType.Touch and input or nil
+        startInput = pointerType == Enum.UserInputType.MouseButton1 and UserInputService:GetMouseLocation() or Vector2.new(input.Position.X, input.Position.Y)
+    end))
+
+    table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+        local isPointerMove = (pointerType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)
+            or (touchInput ~= nil and input == touchInput)
+        if not pointerDown or not isPointerMove then return end
+
+        local point = pointerType == Enum.UserInputType.MouseButton1 and UserInputService:GetMouseLocation() or Vector2.new(input.Position.X, input.Position.Y)
+        local delta = point - startInput
+        if delta.Magnitude > 5 then dragging = true end
+        if dragging then clampFloatingButton(point - floatingButton.AbsoluteSize / 2) end
+    end))
+
+    table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+        local pointerEnded = (pointerType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)
+            or (touchInput ~= nil and input == touchInput)
+        if not pointerDown or not pointerEnded then return end
+
+        if not dragging then toggleMainVisibility() end
+        pointerDown, dragging, pointerType, touchInput = false, false, nil, nil
+        startInput = nil
+    end))
+end
+
+local floatingCameraConn
+local function watchFloatingCamera()
+    if floatingCameraConn then floatingCameraConn:Disconnect() floatingCameraConn = nil end
+    local cam = workspace.CurrentCamera
+    if cam then
+        floatingCameraConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            clampFloatingButton()
+        end)
+        table.insert(connections, floatingCameraConn)
+    end
+end
+watchFloatingCamera()
+table.insert(connections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchFloatingCamera))
 
 local listeningForKey = false
 local function refreshHotkey()
-	hotkeyBtn.Text = listeningForKey and "Press a key..." or ("[ " .. State.Hotkey.Name .. " ]")
-end
+        hotkeyBtn.Text = listeningForKey and "Press a key..." or ("[ " .. State.Hotkey.Name .. " ]")
+    end
 
-hotkeyBtn.MouseButton1Click:Connect(function()
-	if listeningForKey then return end
-	listeningForKey = true
-	refreshHotkey()
-	local conn
-	conn = UserInputService.InputBegan:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-		conn:Disconnect()
-		if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
-			State.Hotkey = input.KeyCode
-		end
-		task.delay(0.15, function()
-			listeningForKey = false
-			refreshHotkey()
-		end)
-	end)
-end)
+    hotkeyBtn.MouseButton1Click:Connect(function()
+        if listeningForKey then return end
+        listeningForKey = true
+        refreshHotkey()
+        local conn
+        conn = UserInputService.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+            conn:Disconnect()
+            if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
+                State.Hotkey = input.KeyCode
+            end
+            task.delay(0.15, function()
+                listeningForKey = false
+                refreshHotkey()
+            end)
+        end)
+    end)
 
-table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if gameProcessed or listeningForKey then return end
-	if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == State.Hotkey then
-		main.Visible = not main.Visible
-		if not main.Visible then closeDropdowns() end
-	end
-end))
+    table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed or listeningForKey then return end
+        if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == State.Hotkey then
+            toggleMainVisibility()
+        end
+    end))
 
+table.insert(refreshers, refreshHotkey)
 -- Dragging
 do
 	local dragging, dragStart, startPos
@@ -4210,6 +4426,8 @@ env.AutumnDice = {
 	GetFeature = GetFeature,
 	SetTowerMode = SetTowerMode,
 	SetSelectedTower = SetSelectedTower,
+	RejoinServer = RejoinServer,
+	ServerHop = ServerHop,
 	GetStatus = function() return State.Status, State.Detail end,
 	GetTowerStatus = function() return State.TowerStatus, State.TowerDetail end,
 	SetHotkey = function(keyCode) State.Hotkey = keyCode notify() end,
