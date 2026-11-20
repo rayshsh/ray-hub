@@ -51,7 +51,7 @@ local CONFIG = {
 
 	-- Auto Roll
 	RollAmount = 5,           -- argument passed to LeafDiceService.RF.Roll
-	RollDelay = 1,            -- seconds to wait AFTER a roll finishes, before the next one
+	RollDelay = 0.5,          -- seconds to wait AFTER a roll finishes, before the next one
 	MaxRollErrors = 5,        -- consecutive failed rolls before the loop stops itself
 	RollErrorDelay = 3,       -- seconds to wait after a failed roll before trying again
 
@@ -79,11 +79,6 @@ local CONFIG = {
 	--   IsRunActive = function() return SomeController.inRun() end,
 	IsRunActive = nil,
 
-	-- Auto Reconnect
-	ReconnectFile = "AutumnDice_Server.json", -- remembers the server (PlaceId/JobId) to rejoin
-	ReconnectMaxAttempts = 5,
-	ReconnectDelay = 5,       -- seconds before the first attempt
-	ReconnectBackoff = 1.5,   -- the delay is multiplied by this after every failed attempt
 	-- Auto-detection looks for these functions on TowerController (only if they exist).
 	RunActiveCandidates = { "isInTower", "isRunning", "isInRun", "hasActiveRun" },
 }
@@ -95,7 +90,7 @@ local TOWER_MODES = { "Single", "Best Leaf Tower" }
 ----------------------------------------------------------------------
 local State = {
 	Features = {
-		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false,
+		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false, AutoBuy = false,
 		-- Miscellaneous
 		AntiAfk = false, AutoReconnect = false, AutoClaimQuest = false,
 	},
@@ -192,17 +187,27 @@ end
 ----------------------------------------------------------------------
 -- Helpers
 ----------------------------------------------------------------------
-local function getRemote(path, timeout)
-	local node = ReplicatedStorage
-	for _, name in ipairs(path) do
-		node = node:WaitForChild(name, timeout)
-		if not node then
-			return nil
-		end
-	end
-	return node
+local function getRemote(path, timeout, shouldContinue)
+    local node = ReplicatedStorage
+    for _, name in ipairs(path) do
+        if shouldContinue then
+            local deadline = timeout and (os.clock() + timeout)
+            local child
+            repeat
+                if not shouldContinue() then return nil end
+                child = node:FindFirstChild(name)
+                if child then break end
+                if deadline and os.clock() >= deadline then return nil end
+                task.wait(0.05)
+            until false
+            node = child
+        else
+            node = node:WaitForChild(name, timeout)
+            if not node then return nil end
+        end
+    end
+    return node
 end
-
 local function pathString(path)
 	return "ReplicatedStorage." .. table.concat(path, ".")
 end
@@ -255,7 +260,8 @@ local function getHRP(timeout)
 	return nil
 end
 
-local AutumnTravel = { travelRemote = nil, traveling = false, movementOwner = nil, questRequested = false, autoQuestMoving = false }
+local AutumnTravel = { travelRemote = nil, traveling = false, movementOwner = nil, questRequested = false, autoQuestMoving = false, autoQuestRequested = false, autoQuestRequestCount = 0,
+	buyRequested = false } -- buyRequested: Auto Buy has absolute movement priority
 
 local function canContinue(shouldContinue)
 	return not shouldContinue or shouldContinue()
@@ -330,7 +336,7 @@ function AutumnTravel.ensureInAutumnWorld(shouldContinue)
 	end
 
 	local found, remote = pcall(function()
-		return AutumnTravel.travelRemote or getRemote({ "Network", "AutumnService", "RF", "Travel" }, CONFIG.RemoteWaitTimeout)
+		return AutumnTravel.travelRemote or getRemote({ "Network", "AutumnService", "RF", "Travel" }, CONFIG.RemoteWaitTimeout, shouldContinue)
 	end)
 	if not found or not remote then return finish(false, "Travel remote not found.") end
 	AutumnTravel.travelRemote = remote
@@ -348,41 +354,32 @@ function AutumnTravel.ensureInAutumnWorld(shouldContinue)
 	if not AutumnTravel.isInAutumnWorld() then return finish(false, "Timed out waiting for Autumn World.") end
 	return finish(true)
 end
-local function stopWalking(humanoid)
-	if not humanoid then return end
-	pcall(function()
-		local root = humanoid.RootPart
-		if root then humanoid:MoveTo(root.Position) end
-		humanoid:Move(Vector3.zero)
-	end)
-end
 function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
-	local zone = AutumnTravel.findZone(zoneName)
-	if not zone then return false, "Zone not found: " .. tostring(zoneName) end
-	local root = getHRP(15)
-	if not canContinue(shouldContinue) then return false, "Cancelled." end
-	if not root then return false, "Character not found." end
-	local frame, size = zone:IsA("Model") and zone:GetBoundingBox() or zone.CFrame, zone:IsA("Model") and select(2, zone:GetBoundingBox()) or zone.Size
-	local offsets = zoneName == "LeafDice"
-		and { Vector3.zero, Vector3.new(12, 0, 0), Vector3.new(-12, 0, 0), Vector3.new(0, 0, 12), Vector3.new(0, 0, -12) }
-		or { Vector3.zero, Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0), Vector3.new(0, 0, 3), Vector3.new(0, 0, -3) }
-	local character = player.Character
-	local rootOffset = character:GetPivot():ToObjectSpace(root.CFrame)
-	for _, offset in ipairs(offsets) do
-		if not canContinue(shouldContinue) then return false, "Cancelled." end
-		local localPoint = Vector3.new(offset.X, 0, offset.Z)
-		if math.abs(localPoint.X) <= size.X / 2 + (margin or 0) and math.abs(localPoint.Z) <= size.Z / 2 + (margin or 0) then
-			local destination = frame * CFrame.new(localPoint)
-			local ok = pcall(function() character:PivotTo(CFrame.new(destination.Position) * (root.CFrame - root.Position) * rootOffset:Inverse()) end)
-			if ok then
-				task.wait()
-				if player.Character == character and AutumnTravel.isNearZone(zoneName, margin) then return true end
-			end
-		end
-	end
-	return false, "Could not verify arrival at zone: " .. tostring(zoneName)
-end
-----------------------------------------------------------------------
+    local zone = AutumnTravel.findZone(zoneName)
+    if not zone then return false, "Zone not found: " .. tostring(zoneName) end
+    local root = getHRP(15)
+    if not canContinue(shouldContinue) then return false, "Cancelled." end
+    if not root then return false, "Character not found." end
+    local frame, size = zone:IsA("Model") and zone:GetBoundingBox() or zone.CFrame, zone:IsA("Model") and select(2, zone:GetBoundingBox()) or zone.Size
+    local offsets = zoneName == "LeafDice"
+        and { Vector3.zero, Vector3.new(12, 0, 0), Vector3.new(-12, 0, 0), Vector3.new(0, 0, 12), Vector3.new(0, 0, -12) }
+        or { Vector3.zero, Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0), Vector3.new(0, 0, 3), Vector3.new(0, 0, -3) }
+    local character = player.Character
+    local rootOffset = character:GetPivot():ToObjectSpace(root.CFrame)
+    for _, offset in ipairs(offsets) do
+        if not canContinue(shouldContinue) then return false, "Cancelled." end
+        local localPoint = Vector3.new(offset.X, 0, offset.Z)
+        if math.abs(localPoint.X) <= size.X / 2 + (margin or 0) and math.abs(localPoint.Z) <= size.Z / 2 + (margin or 0) then
+            local destination = frame * CFrame.new(localPoint)
+            local ok = pcall(function() character:PivotTo(CFrame.new(destination.Position) * (root.CFrame - root.Position) * rootOffset:Inverse()) end)
+            if ok then
+                task.wait()
+                if player.Character == character and AutumnTravel.isNearZone(zoneName, margin) then return true end
+            end
+        end
+    end
+    return false, "Could not verify arrival at zone: " .. tostring(zoneName)
+end----------------------------------------------------------------------
 -- AUTO ROLL
 ----------------------------------------------------------------------
 local runId = 0               -- bumped on every start/stop; stale workers exit
@@ -392,13 +389,17 @@ local function alive(id)
 	return runId == id and State.Features.AutoDice
 end
 
+local function rollPriorityAllows()
+	return not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested
+end
+
 local function sleep(id, seconds)
 	local t0 = os.clock()
 	while os.clock() - t0 < seconds do
-		if not alive(id) then return false end
+		if not alive(id) or not rollPriorityAllows() then return false end
 		task.wait(0.05)
 	end
-	return alive(id)
+	return alive(id) and rollPriorityAllows()
 end
 
 local function failAndStop(id, message)
@@ -413,11 +414,11 @@ end
 
 local function acquireRollMovement(id, owner)
 	while alive(id) do
-		if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving then
+		if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving or AutumnTravel.autoQuestRequested or AutumnTravel.buyRequested then
 			AutumnTravel.release(owner)
 			task.wait(0.05)
-		elseif AutumnTravel.acquire(owner, function() return alive(id) end) then
-			if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving then
+		elseif AutumnTravel.acquire(owner, function() return alive(id) and rollPriorityAllows() end) then
+			if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested then
 				return true
 			end
 			AutumnTravel.release(owner)
@@ -436,8 +437,8 @@ local function runSetup(id, owner)
 	}
 	local remotes = {}
 	for key, path in pairs(paths) do
-		remotes[key] = getRemote(path, CONFIG.RemoteWaitTimeout)
-		if not alive(id) then return nil end
+		remotes[key] = getRemote(path, CONFIG.RemoteWaitTimeout, function() return alive(id) and rollPriorityAllows() end)
+		if not alive(id) or not rollPriorityAllows() then return nil end
 		if not remotes[key] then
 			return failAndStop(id, "Remote not found: " .. pathString(path)) and nil
 		end
@@ -446,8 +447,8 @@ local function runSetup(id, owner)
 
 	-- 1. Ensure arrival in Autumn World
 	SetStatus("Teleporting")
-	local traveled, travelErr = AutumnTravel.ensureInAutumnWorld(function() return alive(id) end)
-	if not alive(id) then return nil end
+	local traveled, travelErr = AutumnTravel.ensureInAutumnWorld(function() return alive(id) and rollPriorityAllows() end)
+	if not alive(id) or not rollPriorityAllows() then return nil end
 	if not traveled then
 		return failAndStop(id, travelErr or "Travel failed.") and nil
 	end
@@ -455,9 +456,10 @@ local function runSetup(id, owner)
 
 	
 	-- 2. Sync the player
+	if not rollPriorityAllows() then return nil end
 	SetStatus("Syncing")
 	local ok, res = invoke(remotes.sync)
-	if not alive(id) then return nil end
+	if not alive(id) or not rollPriorityAllows() then return nil end
 	if not ok or res == false then
 		return failAndStop(id, "Sync failed: " .. tostring(res)) and nil
 	end
@@ -469,13 +471,13 @@ local function runSetup(id, owner)
 		if not acquireRollMovement(id, owner) then return nil end
 		SetStatus("Moving")
 		moved, err = AutumnTravel.pivotToZone("LeafDice", function()
-			return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving
+			return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested
 		end, 10)
 		if moved then break end
 
 		AutumnTravel.release(owner)
 		if not alive(id) then return nil end
-		if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving then
+		if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested then
 			return failAndStop(id, err or "Movement failed.") and nil
 		end
 		task.wait(0.05)
@@ -495,11 +497,11 @@ local function rollLoop(id, rollRemote)
 	State.Rolls = 0
 
 	while alive(id) do
-		if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving then
+		if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving or AutumnTravel.autoQuestRequested or AutumnTravel.buyRequested then
 			task.wait(0.1)
 		else
 			local owner = {}
-			if AutumnTravel.acquire(owner, function() return alive(id) end) then
+			if AutumnTravel.acquire(owner, function() return alive(id) and rollPriorityAllows() end) then
 				if not alive(id) then
 					AutumnTravel.release(owner)
 					return
@@ -508,17 +510,17 @@ local function rollLoop(id, rollRemote)
 				local moved, err = true, nil
 				if not isAtLeafDice() then
 					SetStatus("Moving", "Returning to the LeafDice zone before rolling.")
-					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving end, 10)
+					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested end, 10)
 				end
 				if not moved or not isAtLeafDice() then
 					AutumnTravel.release(owner)
-					if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving then
+					if not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested then
 						if alive(id) then failAndStop(id, err or "Could not verify arrival at LeafDice.") end
 						return
 					end
 				end
 
-				if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving or not alive(id) then
+				if AutumnTravel.questRequested or AutumnTravel.autoQuestMoving or AutumnTravel.autoQuestRequested or AutumnTravel.buyRequested or not alive(id) then
 					AutumnTravel.release(owner)
 				else
 					SetStatus("Rolling", ("Rolling Autumn Dice. Rolls completed: %d"):format(State.Rolls))
@@ -552,35 +554,34 @@ local function rollLoop(id, rollRemote)
 end
 
 local function worker(id)
-	while workerActive or AutumnTravel.autoQuestMoving or AutumnTravel.questRequested do
-		if not alive(id) then return end
-		task.wait(0.05)
-	end
+	while workerActive and alive(id) do task.wait(0.05) end
 	if not alive(id) then return end
 
 	workerActive = true
-	local owner = {}
-	local locked = AutumnTravel.acquire(owner, function() return alive(id) end)
-	local setupStarted = locked
-	local ok, err = pcall(function()
-		if locked and alive(id) then
-			local rollRemote = runSetup(id, owner)
-			AutumnTravel.rollRemote = rollRemote
+	while alive(id) do
+		while alive(id) and not rollPriorityAllows() do task.wait(0.05) end
+		if not alive(id) then break end
+
+		local owner = {}
+		local locked = AutumnTravel.acquire(owner, function()
+			return alive(id) and rollPriorityAllows()
+		end)
+
+		if locked then
+			local ok, rollRemote = pcall(runSetup, id, owner)
 			AutumnTravel.release(owner)
-			locked = false
-			if rollRemote and alive(id) then rollLoop(id, rollRemote) end
+			if not ok then
+				failAndStop(id, "Unexpected error: " .. tostring(rollRemote))
+			elseif rollRemote and alive(id) then
+				AutumnTravel.rollRemote = rollRemote
+				rollLoop(id, rollRemote)
+			end
+		else
+			task.wait(0.05)
 		end
-	end)
-	if locked then AutumnTravel.release(owner) end
-	workerActive = false
-
-	if not setupStarted and alive(id) then
-		failAndStop(id, "Could not acquire movement lock.")
-	elseif not ok then
-		failAndStop(id, "Unexpected error: " .. tostring(err))
 	end
+	workerActive = false
 end
-
 ----------------------------------------------------------------------
 -- AUTO TOWER
 ----------------------------------------------------------------------
@@ -1194,144 +1195,16 @@ local function setAntiAfk(enabled)
 	end)
 end
 
-local HttpService = game:GetService("HttpService")
-local GuiService = game:GetService("GuiService")
-
-local function hasFileApi()
-	return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
-end
-
 ----------------------------------------------------------------------
 -- AUTO RECONNECT
--- While enabled, a disconnect / error prompt starts a retry loop that teleports back to the
--- server saved when the toggle was turned on (or a fresh server if it can't be rejoined).
--- While disabled there are no connections and no loops.
+-- DISABLED: implementation removed. The GUI toggle is kept as a visual-only placeholder;
+-- setAutoReconnect is a no-op so SetFeature / Unload keep working.
 ----------------------------------------------------------------------
-local TeleportService = game:GetService("TeleportService")
-local Reconnect = { conns = {}, token = 0, running = false, gaveUp = false, failed = false }
-
-local function watchDisconnect(cb)
-	local conns = {}
-	local ok, signal = pcall(function() return GuiService.ErrorMessageChanged end)
-	if ok and signal then
-		local connected, conn = pcall(function()
-			return signal:Connect(function(message)
-				if type(message) == "string" and message ~= "" then cb(message) end
-			end)
-		end)
-		if connected and conn then table.insert(conns, conn) end
-	end
-
-	pcall(function()
-		local coreGui = game:GetService("CoreGui")
-		local promptGui = coreGui:FindFirstChild("RobloxPromptGui")
-		local overlay = promptGui and promptGui:FindFirstChild("promptOverlay")
-		if not overlay then return end
-		local function inspect(child)
-			if child.Name == "ErrorPrompt" then cb("error prompt") end
-		end
-		for _, child in ipairs(overlay:GetChildren()) do inspect(child) end
-		table.insert(conns, overlay.ChildAdded:Connect(inspect))
-	end)
-	return conns
-end
-
-local function saveServer()
-	if not hasFileApi() then return end
-	pcall(writefile, CONFIG.ReconnectFile, HttpService:JSONEncode({
-		PlaceId = game.PlaceId,
-		JobId = game.JobId,
-	}))
-end
-
-local function reconnectLoop(token)
-	local maxAttempts, currentAttempt = CONFIG.ReconnectMaxAttempts, 1
-	local delayTime = CONFIG.ReconnectDelay
-	local targetPlaceId, targetJobId = game.PlaceId, game.JobId
-
-	if hasFileApi() and isfile(CONFIG.ReconnectFile) then
-		pcall(function()
-			local saved = HttpService:JSONDecode(readfile(CONFIG.ReconnectFile))
-			if saved and saved.PlaceId == game.PlaceId and type(saved.JobId) == "string" then
-				targetJobId = saved.JobId
-			end
-		end)
-	end
-
-	local failConn
-	pcall(function()
-		failConn = TeleportService.TeleportInitFailed:Connect(function(failedPlayer)
-			if failedPlayer == player then Reconnect.failed = true end
-		end)
-	end)
-
-	local connected = false
-	while currentAttempt <= maxAttempts do
-		task.wait(delayTime)
-		if token ~= Reconnect.token then break end
-
-		Reconnect.failed = false
-		local success, err = pcall(function()
-			if targetJobId and targetJobId ~= "" then
-				TeleportService:TeleportToPlaceInstance(targetPlaceId, targetJobId, player)
-			else
-				TeleportService:Teleport(targetPlaceId, player)
-			end
-		end)
-
-		if success then
-			for _ = 1, 20 do
-				task.wait(0.5)
-				if Reconnect.failed or token ~= Reconnect.token then break end
-			end
-			if token ~= Reconnect.token then break end
-			if not Reconnect.failed then
-				connected = true
-				break
-			end
-			err = "Teleport failed to start"
-		end
-
-		warn(("[AutumnDice] Reconnect attempt %d/%d failed: %s"):format(currentAttempt, maxAttempts, tostring(err)))
-		if targetJobId and targetJobId ~= "" then targetJobId = nil end
-		currentAttempt += 1
-		delayTime *= CONFIG.ReconnectBackoff
-	end
-
-	if failConn then failConn:Disconnect() end
-	if token ~= Reconnect.token then return end
-	Reconnect.running = false
-	if not connected then
-		Reconnect.gaveUp = true
-		warn("[AutumnDice] Auto Reconnect gave up after " .. maxAttempts .. " attempts.")
-	end
-end
-
-local function onReconnectNeeded(reason)
-	if Reconnect.running or Reconnect.gaveUp or not State.Features.AutoReconnect then return end
-	Reconnect.running = true
-	warn("[AutumnDice] Disconnected (" .. tostring(reason) .. "). Reconnecting...")
-	task.spawn(function()
-		local ok, err = pcall(reconnectLoop, Reconnect.token)
-		if not ok then
-			Reconnect.running = false
-			warn("[AutumnDice] Auto Reconnect error: " .. tostring(err))
-		end
-	end)
-end
-
 local function setAutoReconnect(enabled)
-	Reconnect.token += 1
-	Reconnect.running = false
-	for _, conn in ipairs(Reconnect.conns) do pcall(function() conn:Disconnect() end) end
-	Reconnect.conns = {}
-	if not enabled then return end
-
-	Reconnect.gaveUp = false
-	saveServer()
-	Reconnect.conns = watchDisconnect(onReconnectNeeded)
+	-- intentionally empty: no connections, no saved server, no teleports
 end
 local setAutoClaim
+local AutoBuy = {} -- filled in by the Auto Buy section (Event tab)
 local setAutoQuest
 
 local function SetFeature(name, value)
@@ -1373,6 +1246,9 @@ local function SetFeature(name, value)
 		notify()
 	elseif name == "AutoQuest" then
 		if setAutoQuest then setAutoQuest(value) end
+		notify()
+	elseif name == "AutoBuy" then
+		if AutoBuy.setEnabled then AutoBuy.setEnabled(value) end
 		notify()
 	else
 		notify()
@@ -1647,7 +1523,7 @@ local catcher = create("TextButton", {
 
 local function closeDropdowns()
 	if openDropdown then
-		openDropdown.list.Visible = false
+		openDropdown.Close()
 		openDropdown = nil
 	end
 	catcher.Visible = false
@@ -1691,7 +1567,6 @@ local content = create("ScrollingFrame", {
 	CanvasSize = UDim2.new(),
 	Parent = bodyRow,
 }, { pad(0, 0, 6, 0) })
-content:GetPropertyChangedSignal("CanvasPosition"):Connect(closeDropdowns)
 
 -- Two-column container: two equal columns side by side on wide windows, stacked on narrow ones.
 -- Equal widths come from 0.5 scale minus half the gap, so the columns stay even and aligned.
@@ -1768,7 +1643,6 @@ local function applyLayout()
 	sidebar.Size = UDim2.new(0, sideW, 1, 0)
 	content.Position = UDim2.fromOffset(sideW + SIDEBAR_GAP, 0)
 	content.Size = UDim2.new(1, -(sideW + SIDEBAR_GAP), 1, 0)
-	closeDropdowns()
 
 	-- if the new size pushed the window off screen, put it back in the middle
 	task.delay(0.1, function()
@@ -1990,7 +1864,50 @@ local function makeToggle(parent, order, labelText, featureName)
 end
 
 -- Label on top, full-width select field below, popup list overlays everything
-local function makeDropdown(parent, order, labelText, onSelect)
+-- ---------------------------------------------------------------------------
+-- Reusable dropdown: the standard dropdown for every feature (Auto Tower, Auto Buy, ...).
+--
+--   local dd = makeDropdown(parent, order, {
+--       label       = "Mode",          -- text above the trigger (nil = no label)
+--       placeholder = "None",          -- trigger text while nothing is selected
+--       emptyText   = "No options",    -- panel text when there are no options
+--       multi       = false,           -- true = several options can be selected; the panel stays
+--                                      --        open and has Select All / Clear buttons
+--       searchable  = false,           -- adds a search box to the panel
+--       maxHeight   = 130,             -- tallest the option list gets (it scrolls beyond that)
+--       onSelect    = function(key, isSelected) end, -- single: picked option; multi: toggled one
+--       onChange    = function(selectedSet) end,     -- after every change of the selection
+--   })
+--
+-- Options are strings, or { key = "id", label = "Shown text" }. Only the label is displayed.
+--
+-- Look: every option is plain text. The selected option(s) use the accent font colour, all others
+-- the default one. No checkbox, no highlight. The trigger shows the selected name; in multi mode
+-- it shows every selected name, comma separated (cut with "..." when too long), or the
+-- placeholder when nothing is selected.
+--
+-- Returned object: SetOptions, SetValue, SetSelected, GetSelected, SetDimmed, SetLabel,
+-- SetPlaceholder, Open, Close, Reposition.
+--
+-- Placement (relative to the real screen, in an overlay above the whole UI, so no parent can clip
+-- or cover it): the panel sits completely below the trigger when it fits there, otherwise
+-- completely above it, otherwise on the roomier side with the option list shrunk (it scrolls on
+-- its own). A fixed gap separates panel and trigger, so the two never overlap. While open the
+-- position is recalculated every time the trigger moves or the screen changes (scroll, window
+-- drag / resize, layout changes, filtering); it closes when the trigger is scrolled out of view.
+-- ---------------------------------------------------------------------------
+local DROPDOWN_ITEM_H = 26
+local DROPDOWN_GAP = 4         -- space between trigger and panel
+local DROPDOWN_MARGIN = 8      -- keep this far from the screen edges
+
+local function makeDropdown(parent, order, config)
+	config = config or {}
+	local multi = config.multi == true
+	local searchable = config.searchable == true
+	local actions = multi and config.actions ~= false
+	local maxListH = config.maxHeight or 130
+	local placeholder = config.placeholder or "None"
+
 	local wrap = create("Frame", {
 		LayoutOrder = order,
 		Size = UDim2.new(1, 0, 0, 0),
@@ -1998,15 +1915,16 @@ local function makeDropdown(parent, order, labelText, onSelect)
 		BackgroundTransparency = 1,
 		Parent = parent,
 	}, { vlist(4) })
-	create("TextLabel", {
+	local labelText = create("TextLabel", {
 		LayoutOrder = 1,
 		Size = UDim2.new(1, 0, 0, 16),
 		BackgroundTransparency = 1,
-		Text = labelText,
+		Text = config.label or "",
 		Font = Enum.Font.GothamMedium,
 		TextSize = 12,
 		TextColor3 = THEME.text,
 		TextXAlignment = Enum.TextXAlignment.Left,
+		Visible = config.label ~= nil,
 		Parent = wrap,
 	})
 	local btn = create("TextButton", {
@@ -2021,109 +1939,380 @@ local function makeDropdown(parent, order, labelText, onSelect)
 		Size = UDim2.new(1, -32, 1, 0),
 		Position = UDim2.fromOffset(10, 0),
 		BackgroundTransparency = 1,
-		Text = "",
+		Text = placeholder,
 		Font = Enum.Font.GothamMedium,
 		TextSize = 12,
 		TextColor3 = THEME.text,
+		TextWrapped = false,
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = btn,
 	})
 	makeChevron(btn, UDim2.new(1, -14, 0.5, 0), THEME.body)
 
-	-- popup lives directly under the ScreenGui so the card layouts never move it
-	local list = create("ScrollingFrame", {
-		Size = UDim2.fromOffset(200, 30),
+	-- the panel is a child of the ScreenGui (not of any card), so card layouts / scroll frames can
+	-- never clip it and it is always drawn above the rest of the UI
+	local panel = create("Frame", {
 		BackgroundColor3 = THEME.popup,
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		Visible = false,
+		ZIndex = 20,
+		Parent = gui,
+	}, { corner(8), stroke(THEME.stroke) })
+
+	local headerH = 0
+	local searchBox = nil
+	if searchable then
+		searchBox = create("TextBox", {
+			Position = UDim2.fromOffset(6, 6),
+			Size = UDim2.new(1, -12, 0, 22),
+			BackgroundColor3 = THEME.field,
+			BorderSizePixel = 0,
+			Text = "",
+			PlaceholderText = "Search...",
+			PlaceholderColor3 = THEME.subtext,
+			TextColor3 = THEME.text,
+			Font = Enum.Font.GothamMedium,
+			TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ClearTextOnFocus = false,
+			ZIndex = 21,
+			Parent = panel,
+		}, { corner(6), pad(8, 0, 8, 0) })
+		headerH += 34
+	end
+
+	local selectAllBtn, clearBtn = nil, nil
+	if actions then
+		if not searchable then headerH += 6 end
+		local function actionButton(text, x)
+			return create("TextButton", {
+				Position = UDim2.new(x, x == 0 and 6 or 3, 0, headerH),
+				Size = UDim2.new(0.5, -9, 0, 22),
+				BackgroundColor3 = THEME.field,
+				BorderSizePixel = 0,
+				Text = text,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 11,
+				TextColor3 = THEME.body,
+				AutoButtonColor = true,
+				ZIndex = 21,
+				Parent = panel,
+			}, { corner(6) })
+		end
+		selectAllBtn = actionButton("Select All", 0)
+		clearBtn = actionButton("Clear", 0.5)
+		headerH += 28
+	end
+	if headerH > 0 then headerH += 2 end
+
+	local list = create("ScrollingFrame", {
+		Position = UDim2.fromOffset(0, headerH),
+		Size = UDim2.new(1, 0, 1, -headerH),
+		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
 		ScrollBarThickness = 3,
 		ScrollBarImageColor3 = THEME.accent,
 		AutomaticCanvasSize = Enum.AutomaticSize.Y,
 		CanvasSize = UDim2.new(),
-		Visible = false,
 		ZIndex = 20,
-		Parent = gui,
-	}, {
-		corner(8),
-		stroke(THEME.stroke),
-		create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
+		Parent = panel,
+	}, { create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }) })
+
+	local emptyLabel = create("TextLabel", {
+		LayoutOrder = 0,
+		Size = UDim2.new(1, 0, 0, DROPDOWN_ITEM_H),
+		BackgroundTransparency = 1,
+		Text = config.emptyText or "No options",
+		Font = Enum.Font.Gotham,
+		TextSize = 12,
+		TextColor3 = THEME.subtext,
+		ZIndex = 21,
+		Parent = list,
 	})
 
-	local dd = { list = list, value = nil, options = {}, items = {} }
+	local dd = { options = {}, byKey = {}, itemList = {}, value = nil, selected = {}, panel = panel }
+	local visibleCount = 0
+	local watchConn = nil
 
-	local function paintItems()
-		for name, item in pairs(dd.items) do
-			item.TextColor3 = (name == dd.value) and THEME.accent or THEME.text
+	-- ----------------------------------------------------------------- display
+	local function updateTrigger()
+		local text
+		if multi then
+			-- every selected name, in option order, comma separated (the label truncates with "...")
+			local names = {}
+			for _, option in ipairs(dd.options) do
+				if dd.selected[option.key] then table.insert(names, option.label) end
+			end
+			text = #names > 0 and table.concat(names, ", ") or placeholder
+		else
+			local option = dd.value ~= nil and dd.byKey[dd.value] or nil
+			text = option and option.label or (dd.value ~= nil and tostring(dd.value)) or placeholder
+		end
+		if valueLabel.Text ~= text then valueLabel.Text = text end
+	end
+
+	-- selected = accent font colour, everything else = default font colour
+	local function paintItem(item)
+		local key = item.option.key
+		local on = (multi and dd.selected[key] == true) or (not multi and key == dd.value)
+		item.button.TextColor3 = on and THEME.accent or item.option.color or THEME.text
+	end
+
+	local function paintAll()
+		for _, item in ipairs(dd.itemList) do paintItem(item) end
+		updateTrigger()
+	end
+
+	-- ----------------------------------------------------------------- placement
+	-- All maths is in absolute screen space; `origin` converts to the overlay's local space.
+	function dd.Reposition()
+		if dd.isOpen ~= true or not panel.Parent then return end
+		local origin, viewport = gui.AbsolutePosition, gui.AbsoluteSize
+		local trigPos, trigSize = btn.AbsolutePosition, btn.AbsoluteSize
+
+		local screenTop, screenBottom = origin.Y + DROPDOWN_MARGIN, origin.Y + viewport.Y - DROPDOWN_MARGIN
+		local screenLeft, screenRight = origin.X + DROPDOWN_MARGIN, origin.X + viewport.X - DROPDOWN_MARGIN
+
+		local width = math.max(math.min(trigSize.X, screenRight - screenLeft), 0)
+		local wanted = headerH + math.min(math.max(visibleCount, 1) * DROPDOWN_ITEM_H, maxListH)
+
+		-- the free space on each side of the trigger, after the fixed gap
+		local belowTop = trigPos.Y + trigSize.Y + DROPDOWN_GAP
+		local aboveBottom = trigPos.Y - DROPDOWN_GAP
+		local spaceBelow = math.max(screenBottom - belowTop, 0)
+		local spaceAbove = math.max(aboveBottom - screenTop, 0)
+
+		-- below if it fits, else above if it fits, else the roomier side (the list then scrolls)
+		local placeBelow
+		if spaceBelow >= wanted then
+			placeBelow = true
+		elseif spaceAbove >= wanted then
+			placeBelow = false
+		else
+			placeBelow = spaceBelow >= spaceAbove
+		end
+
+		local height = math.min(wanted, placeBelow and spaceBelow or spaceAbove)
+		-- below: starts under the trigger. above: ends over the trigger. Either way the panel
+		-- lies completely outside the trigger rectangle.
+		local top = placeBelow and belowTop or (aboveBottom - height)
+		local x = math.clamp(trigPos.X, screenLeft, math.max(screenLeft, screenRight - width))
+
+		panel.Position = UDim2.fromOffset(x - origin.X, top - origin.Y)
+		panel.Size = UDim2.fromOffset(width, height)
+		dd.placement = placeBelow and "below" or "above"
+	end
+
+	-- false when the trigger is hidden, or scrolled completely out of a scrolling / clipping parent
+	local function triggerVisible()
+		local pos, size = btn.AbsolutePosition, btn.AbsoluteSize
+		local node = btn
+		while node and node ~= gui do
+			if node:IsA("GuiObject") then
+				if not node.Visible then return false end
+				if node ~= btn and (node.ClipsDescendants or node:IsA("ScrollingFrame")) then
+					local p, s = node.AbsolutePosition, node.AbsoluteSize
+					if pos.X + size.X <= p.X or pos.X >= p.X + s.X or pos.Y + size.Y <= p.Y or pos.Y >= p.Y + s.Y then
+						return false
+					end
+				end
+			end
+			node = node.Parent
+		end
+		return node == gui
+	end
+
+	local function applyFilter()
+		local query = searchBox and string.lower(searchBox.Text) or ""
+		local count = 0
+		for _, item in ipairs(dd.itemList) do
+			local match = query == "" or string.find(string.lower(item.option.label), query, 1, true) ~= nil
+			item.button.Visible = match
+			if match then count += 1 end
+		end
+		visibleCount = count
+		emptyLabel.Visible = count == 0
+		emptyLabel.Text = (#dd.options == 0) and (config.emptyText or "No options") or "No matches"
+		dd.Reposition()
+	end
+	if searchBox then searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter) end
+
+	-- ----------------------------------------------------------------- open / close
+	function dd.Close()
+		dd.isOpen = false
+		panel.Visible = false
+		if watchConn then
+			watchConn:Disconnect()
+			watchConn = nil
 		end
 	end
 
-	function dd.SetValue(value)
-		dd.value = value
-		valueLabel.Text = value or "None"
-		paintItems()
+	function dd.Open()
+		closeDropdowns()
+		openDropdown = dd
+		dd.isOpen = true
+		if searchBox and searchBox.Text ~= "" then searchBox.Text = "" end
+		applyFilter()
+		panel.Visible = true
+		catcher.Visible = true
+		dd.Reposition()
+
+		-- recalculate whenever the trigger moves or the screen changes: page scroll, window drag
+		-- or resize, layout changes, filtering
+		local last = { 0, 0, 0, 0, 0, 0, 0, 0, -1 }
+		watchConn = game:GetService("RunService").Heartbeat:Connect(function()
+			if not panel.Parent or not btn.Parent then
+				closeDropdowns()
+				return
+			end
+			if not triggerVisible() then
+				closeDropdowns()
+				return
+			end
+			local pos, size = btn.AbsolutePosition, btn.AbsoluteSize
+			local origin, viewport = gui.AbsolutePosition, gui.AbsoluteSize
+			if pos.X ~= last[1] or pos.Y ~= last[2] or size.X ~= last[3] or size.Y ~= last[4]
+				or viewport.X ~= last[5] or viewport.Y ~= last[6] or origin.X ~= last[7] or origin.Y ~= last[8]
+				or visibleCount ~= last[9] then
+				last = { pos.X, pos.Y, size.X, size.Y, viewport.X, viewport.Y, origin.X, origin.Y, visibleCount }
+				dd.Reposition()
+			end
+		end)
+	end
+
+	btn.MouseButton1Click:Connect(function()
+		if openDropdown == dd then
+			closeDropdowns()
+		else
+			dd.Open()
+		end
+	end)
+
+	-- ----------------------------------------------------------------- selection
+	local function notifyChange()
+		if config.onChange then config.onChange(dd.selected) end
+	end
+
+	local function choose(option)
+		if multi then
+			local on = not dd.selected[option.key]
+			dd.selected[option.key] = on and true or nil
+			paintAll()
+			if config.onSelect then config.onSelect(option.key, on) end
+			notifyChange()
+		else
+			dd.value = option.key
+			paintAll()
+			closeDropdowns()
+			if config.onSelect then config.onSelect(option.key, true) end
+			notifyChange()
+		end
+	end
+
+	if selectAllBtn then
+		selectAllBtn.MouseButton1Click:Connect(function()
+			for _, item in ipairs(dd.itemList) do
+				local key = item.option.key
+				if item.button.Visible and not dd.selected[key] then
+					dd.selected[key] = true
+					if config.onSelect then config.onSelect(key, true) end
+				end
+			end
+			paintAll()
+			notifyChange()
+		end)
+		clearBtn.MouseButton1Click:Connect(function()
+			for key in pairs(dd.selected) do
+				dd.selected[key] = nil
+				if config.onSelect then config.onSelect(key, false) end
+			end
+			paintAll()
+			notifyChange()
+		end)
+	end
+
+	-- ----------------------------------------------------------------- public API
+	local function normalize(option)
+		if type(option) == "table" then
+			local label = tostring(option.label or option.key)
+			return { key = option.key ~= nil and option.key or label, label = label, color = option.color }
+		end
+		return { key = option, label = tostring(option) }
 	end
 
 	function dd.SetOptions(options)
-		dd.options = options
-		for _, item in pairs(dd.items) do item:Destroy() end
-		dd.items = {}
-		for _, child in ipairs(list:GetChildren()) do
-			if child:IsA("TextLabel") then child:Destroy() end
-		end
+		for _, item in ipairs(dd.itemList) do item.button:Destroy() end
+		dd.itemList, dd.byKey, dd.options = {}, {}, {}
 
-		if #options == 0 then
-			create("TextLabel", {
-				Size = UDim2.new(1, 0, 0, 26),
-				BackgroundTransparency = 1,
-				Text = "No towers found",
-				Font = Enum.Font.Gotham,
-				TextSize = 12,
-				TextColor3 = THEME.subtext,
-				ZIndex = 21,
-				Parent = list,
-			})
-		end
+		for i, raw in ipairs(options or {}) do
+			local option = normalize(raw)
+			table.insert(dd.options, option)
+			dd.byKey[option.key] = option
 
-		for i, optName in ipairs(options) do
-			local item = create("TextButton", {
-				Size = UDim2.new(1, 0, 0, 26),
+			local button = create("TextButton", {
+				Size = UDim2.new(1, 0, 0, DROPDOWN_ITEM_H),
 				LayoutOrder = i,
 				BackgroundTransparency = 1,
-				Text = optName,
+				Text = option.label,
 				Font = Enum.Font.GothamMedium,
 				TextSize = 12,
 				TextColor3 = THEME.text,
 				TextTruncate = Enum.TextTruncate.AtEnd,
 				TextXAlignment = Enum.TextXAlignment.Left,
+				AutoButtonColor = false,
 				ZIndex = 21,
 				Parent = list,
 			}, { pad(10, 0, 6, 0) })
-			item.MouseButton1Click:Connect(function()
-				closeDropdowns()
-				onSelect(optName)
-			end)
-			dd.items[optName] = item
+			button.MouseButton1Click:Connect(function() choose(option) end)
+			table.insert(dd.itemList, { option = option, button = button })
 		end
-		paintItems()
+
+		-- keep only selections that still exist
+		for key in pairs(dd.selected) do
+			if not dd.byKey[key] then dd.selected[key] = nil end
+		end
+		applyFilter()
+		paintAll()
+	end
+
+	-- single mode: select by key
+	function dd.SetValue(value)
+		if dd.value == value then return end
+		dd.value = value
+		paintAll()
+	end
+
+	-- multi mode: an array of keys or a { [key] = true } set (replaces the selection in place)
+	function dd.SetSelected(keys)
+		for key in pairs(dd.selected) do dd.selected[key] = nil end
+		for k, v in pairs(keys or {}) do
+			if type(k) == "number" then dd.selected[v] = true
+			elseif v then dd.selected[k] = true end
+		end
+		paintAll()
+	end
+
+	function dd.GetSelected()
+		local copy = {}
+		for key in pairs(dd.selected) do copy[key] = true end
+		return copy
 	end
 
 	function dd.SetDimmed(dimmed)
 		valueLabel.TextTransparency = dimmed and 0.45 or 0
 	end
 
-	btn.MouseButton1Click:Connect(function()
-		if openDropdown == dd then
-			closeDropdowns()
-			return
-		end
-		closeDropdowns()
-		local pos, size = btn.AbsolutePosition, btn.AbsoluteSize
-		list.Position = UDim2.fromOffset(pos.X, pos.Y + size.Y + 4)
-		list.Size = UDim2.fromOffset(size.X, math.clamp(math.max(#dd.options, 1) * 26, 26, 130))
-		openDropdown = dd
-		list.Visible = true
-		catcher.Visible = true
-	end)
+	function dd.SetLabel(text)
+		labelText.Text = text or ""
+		labelText.Visible = text ~= nil
+	end
+
+	function dd.SetPlaceholder(text)
+		placeholder = text or "None"
+		updateTrigger()
+	end
 
 	return dd
 end
@@ -2197,14 +2386,17 @@ local towerBody = makeCard(towerTab.left, function(tile)
 	end
 end, "Auto Tower")
 
-local modeDropdown = makeDropdown(towerBody, 1, "Mode", function(choice)
-	SetTowerMode(choice)
-end)
+local modeDropdown = makeDropdown(towerBody, 1, {
+	label = "Mode",
+	onSelect = function(choice) SetTowerMode(choice) end,
+})
 modeDropdown.SetOptions(TOWER_MODES)
 
-local towerDropdown = makeDropdown(towerBody, 2, "Tower", function(choice)
-	SetSelectedTower(choice)
-end)
+local towerDropdown = makeDropdown(towerBody, 2, {
+	label = "Tower",
+	emptyText = "No towers found",
+	onSelect = function(choice) SetSelectedTower(choice) end,
+})
 towerDropdown.SetOptions({})
 
 makeToggle(towerBody, 3, "Auto Equip Best Team", "AutoEquipBest")
@@ -2227,7 +2419,7 @@ statsLine.TextTruncate = Enum.TextTruncate.AtEnd
 ----------------------------------------------------------------------
 -- Tab: Miscellaneous
 ----------------------------------------------------------------------
-local miscBody = makeCard(addTab(3, "Miscellaneous").left, function(tile)
+local miscBody = makeCard(addTab(4, "Miscellaneous").left, function(tile)
 	-- settings icon: three stacked bars
 	for i, w in ipairs({ 14, 9, 12 }) do
 		create("Frame", {
@@ -2269,7 +2461,7 @@ local function questIcon(tile)
 	}, { pill() })
 end
 
-local eventTab = addTab(4, "Event")
+local eventTab = addTab(3, "Event")
 local rollCard = rollBody.Parent
 rollCard.Parent = eventTab.left
 rollCard.LayoutOrder = 1
@@ -2531,7 +2723,7 @@ local function autoClaimEnabled(token)
 end
 
 local function autoClaimActive(token)
-	return autoClaimEnabled(token) and AutoClaim.AutumnConfig.ACTIVE == true
+	return autoClaimEnabled(token) and AutoClaim.AutumnConfig.ACTIVE == true and not AutumnTravel.buyRequested and not AutumnTravel.autoQuestRequested
 end
 
 local function isAtQuestBoard()
@@ -2635,7 +2827,7 @@ local function autoClaimWorker(token)
 			else
 				local owner = {}
 				AutumnTravel.questRequested = true
-				if AutumnTravel.acquire(owner, function() return autoClaimEnabled(token) end) then
+				if AutumnTravel.acquire(owner, function() return autoClaimActive(token) end) then
 					local ok, err = pcall(function()
 						if not AutumnTravel.isInAutumnWorld() or not isAtQuestBoard() then
 							needsSync = true
@@ -2659,8 +2851,8 @@ local function autoClaimWorker(token)
 							end
 						end
 
-						if State.Features.AutoDice and autoClaimEnabled(token) then
-							local returned, returnErr = AutumnTravel.pivotToZone("LeafDice", function() return autoClaimEnabled(token) end, 10)
+						if State.Features.AutoDice and autoClaimActive(token) then
+							local returned, returnErr = AutumnTravel.pivotToZone("LeafDice", function() return autoClaimActive(token) end, 10)
 							if not returned or not isAtLeafDice() then error(returnErr or "Could not verify return to LeafDice.") end
 						end
 					end)
@@ -2693,6 +2885,355 @@ task.spawn(function()
 		end
 	end
 end)
+----------------------------------------------------------------------
+-- AUTO BUY (Event tab -> Apple Shop card)
+-- Buys the selected Apple Shop items through AppleShopService.Buy.
+--
+-- Execution priority: Auto Buy > Auto Quest > Auto Claim Quest > Auto Roll.
+-- When a pass starts it raises AutumnTravel.buyRequested. Every other feature checks that flag
+-- in all of its movement loops, so each of them aborts its current move, releases the movement
+-- lock and waits. Auto Buy then takes the lock (so two features never move at once), teleports
+-- to the shop zone, buys, releases the lock and lowers the flag. Roll / Quest / Claim then
+-- resume on their own (Auto Roll pivots back to the Leaf Dice, Auto Quest restarts its activity).
+----------------------------------------------------------------------
+AutoBuy.token = 0
+AutoBuy.workerActive = false
+AutoBuy.loaded = false
+AutoBuy.built = false
+AutoBuy.DataController = nil
+AutoBuy.dataHooks = {}
+AutoBuy.hooked = {}
+AutoBuy.offers = {}     -- Apple Shop offers in config order
+AutoBuy.rows = {}       -- [offerId] = { offer, frame, check, fill }
+AutoBuy.selected = {}   -- [offerId] = true
+AutoBuy.status = "Off"
+AutoBuy.passDelay = 2   -- seconds between passes while purchases succeed (others may move)
+AutoBuy.idleDelay = 10  -- seconds between passes when nothing could be bought
+
+function AutoBuy.alive(token)
+	return AutoBuy.token == token and State.Features.AutoBuy
+end
+
+function AutoBuy.sleep(token, seconds)
+	local t0 = os.clock()
+	while os.clock() - t0 < seconds do
+		if not AutoBuy.alive(token) then return false end
+		task.wait(0.1)
+	end
+	return AutoBuy.alive(token)
+end
+
+function AutoBuy.selectedCount()
+	local n = 0
+	for _ in pairs(AutoBuy.selected) do n += 1 end
+	return n
+end
+
+-- ---------------------------------------------------------------- modules
+function AutoBuy.loadModules()
+	if AutoBuy.loaded then return true end
+	local ok, err = pcall(function()
+		local features = ReplicatedStorage.Framework.Features
+		local Network = require(ReplicatedStorage.Packages.Network)
+		AutoBuy.Config = require(features.Autumn.AppleShopConfig)
+		AutoBuy.DataController = require(features.Data.DataController)
+		AutoBuy.buy = Network.ClientComm.new(ReplicatedStorage.Network, false, "AppleShopService"):GetFunction("Buy")
+	end)
+	if not ok then
+		AutoBuy.loadError = tostring(err)
+		return false
+	end
+	AutoBuy.loadError = nil
+	AutoBuy.loaded = true
+	AutoBuy.hookData()
+	return true
+end
+
+-- ---------------------------------------------------------------- status / list UI
+function AutoBuy.setStatus(text)
+	AutoBuy.status = text
+	AutoBuy.refresh()
+end
+
+function AutoBuy.refresh()
+	local line = AutoBuy.statusLine
+	if not line then return end
+	local text = AutoBuy.status
+	pcall(function()
+		if line.Text ~= text then line.Text = text end
+	end)
+end
+
+local function getOfferLimit(offer)
+    local spec = offer.limit
+    local period = offer.limitPeriod or offer.limitType or offer.reset or offer.period
+    if type(spec) == "table" then
+        period = spec.period or spec.reset or period
+        if spec.daily ~= nil then
+            spec, period = spec.daily, "daily"
+        elseif spec.total ~= nil then
+            spec, period = spec.total, "total"
+        else
+            spec = spec.amount or spec.count or spec.max or spec.limit
+        end
+    end
+    return tonumber(spec), tostring(period or ""):lower()
+end
+
+local function getBought(offer)
+    local ok, count = pcall(function()
+        local autumn = AutoBuy.DataController.Autumn
+        local day = autumn.ShopDay()
+        local purchases = autumn.ShopPurchases()
+        if type(purchases) ~= "table" then return 0 end
+
+        local _, period = getOfferLimit(offer)
+        local isTotal = period:find("total", 1, true) or period:find("lifetime", 1, true)
+        local counts = purchases
+        if not isTotal and day ~= nil then
+            local today = purchases[day] or purchases[tostring(day)]
+            if type(today) == "table" then counts = today end
+        end
+
+        local bought = counts[offer.id]
+        if type(bought) == "table" then
+            local recordDay = bought.day or bought.shopDay
+            if not isTotal and recordDay ~= nil and day ~= nil and recordDay ~= day then return 0 end
+            if isTotal then
+                bought = bought.total or bought.count or bought.amount
+            else
+                bought = bought.today or bought.daily or bought.count or bought.amount or bought.total
+            end
+        end
+        return tonumber(bought) or 0
+    end)
+    return ok and count or 0
+end
+
+local function isSoldOut(offer, boughtOverride)
+    local limit = getOfferLimit(offer)
+    local bought = getBought(offer)
+    if boughtOverride ~= nil then bought = math.max(bought, boughtOverride) end
+    return limit ~= nil and bought >= limit
+end
+
+local function offerOption(offer)
+    local parts = { offer.id }
+    local limit, period = getOfferLimit(offer)
+    local bought = limit ~= nil and getBought(offer) or 0
+    local soldOut = limit ~= nil and bought >= limit
+    if limit ~= nil then
+        local suffix = (period:find("day", 1, true) or period == "daily") and " today" or ""
+        table.insert(parts, ("%d/%d%s"):format(bought, limit, suffix))
+    end
+
+    return { key = offer.id, label = table.concat(parts, "  ·  "), color = soldOut and RED or nil }
+end
+
+local function uniqueOffers(offers)
+    local unique, seen = {}, {}
+    for _, offer in offers do
+        if type(offer) == "table" and type(offer.id) == "string" then
+            local key = string.lower(string.match(offer.id, "^%s*(.-)%s*$"))
+            if key ~= "" and not seen[key] then
+                seen[key] = true
+                table.insert(unique, offer)
+            end
+        end
+    end
+    return unique
+end
+function AutoBuy.refreshOptions()
+    if not AutoBuy.built or not AutoBuy.dropdown then return end
+    AutoBuy.offers = uniqueOffers(AutoBuy.offers)
+    local options = {}
+    for _, offer in ipairs(AutoBuy.offers) do
+        table.insert(options, offerOption(offer))
+    end
+    AutoBuy.dropdown.SetOptions(options)
+end
+
+function AutoBuy.hookData()
+    if not AutoBuy.DataController then return end
+    local autumn = AutoBuy.DataController.Autumn
+    for _, name in ipairs({ "ShopPurchases", "ShopDay" }) do
+        if not AutoBuy.hooked[name] then
+            local ok, conn = pcall(function()
+                return autumn[name].Changed(AutoBuy.refreshOptions)
+            end)
+            if ok then
+                AutoBuy.hooked[name] = true
+                if conn then table.insert(AutoBuy.dataHooks, conn) end
+            end
+        end
+    end
+end
+
+function AutoBuy.build()
+    if AutoBuy.built or not AutoBuy.loadModules() then return end
+    local offers = AutoBuy.Config.Offers
+    if type(offers) ~= "table" then return end
+
+    AutoBuy.offers = uniqueOffers(offers)
+    local options = {}
+    for _, offer in ipairs(AutoBuy.offers) do table.insert(options, offerOption(offer)) end
+    AutoBuy.dropdown.SetOptions(options)
+    AutoBuy.built = true
+    AutoBuy.hookData()
+    AutoBuy.refresh()
+end
+-- ---------------------------------------------------------------- the purchase pass
+-- One pass: take absolute movement priority, go to the shop, buy every selected item, give the
+-- movement back. Returns true when at least one purchase was reported successful.
+function AutoBuy.runPass(token)
+    local offers = {}
+    local selectedCount, soldOutCount = 0, 0
+    for _, offer in ipairs(AutoBuy.offers) do
+        if AutoBuy.selected[offer.id] then
+            selectedCount += 1
+            if isSoldOut(offer) then
+                soldOutCount += 1
+            else
+                table.insert(offers, offer)
+            end
+        end
+    end
+    if #offers == 0 then return false, selectedCount > 0 and soldOutCount == selectedCount end
+
+    AutoBuy.setStatus("Taking control of the character")
+    AutumnTravel.buyRequested = true
+
+    local owner = {}
+    if not AutumnTravel.acquire(owner, function() return AutoBuy.alive(token) end) then
+        AutumnTravel.buyRequested = false
+        return false, false
+    end
+
+    local bought = false
+    local ok, err = pcall(function()
+        local keepGoing = function() return AutoBuy.alive(token) end
+
+        AutoBuy.setStatus("Moving to the Apple Shop")
+        local arrived, travelErr = AutumnTravel.ensureInAutumnWorld(keepGoing)
+        if not arrived then error(travelErr or "Could not enter Autumn World.", 0) end
+        local moved, moveErr = AutumnTravel.pivotToZone(AutoBuy.Config.ZONE, keepGoing, 6)
+        if not moved then error(moveErr or "Could not reach the Apple Shop.", 0) end
+        task.wait(0.2)
+
+        AutoBuy.setStatus("Buying")
+        for _, offer in ipairs(offers) do
+            local boughtCount = getBought(offer)
+            while keepGoing() and AutoBuy.selected[offer.id] and not isSoldOut(offer, boughtCount) do
+                local okBuy, result = pcall(AutoBuy.buy, offer.id)
+                if not okBuy or not result then break end
+                bought = true
+                boughtCount = math.max(boughtCount + 1, getBought(offer))
+
+                -- Recheck the item limit before waiting or requesting another purchase.
+                if not AutoBuy.selected[offer.id] or not keepGoing() or isSoldOut(offer, boughtCount) then break end
+                task.wait((AutoBuy.Config.REQUEST_DEBOUNCE or 0.5) + 0.1)
+            end
+        end
+    end)
+
+    AutumnTravel.release(owner)
+    AutumnTravel.buyRequested = false
+
+    if not ok and AutoBuy.alive(token) then
+        warn("[AutumnDice] Auto Buy: " .. tostring(err))
+        AutoBuy.setStatus("Error: " .. tostring(err))
+    end
+    return bought, false
+end
+function AutoBuy.worker(token)
+	while AutoBuy.workerActive and AutoBuy.alive(token) do task.wait(0.1) end
+	if not AutoBuy.alive(token) then return end
+
+	AutoBuy.workerActive = true
+	while AutoBuy.alive(token) do
+		if not AutoBuy.loadModules() then
+			AutoBuy.setStatus("Waiting for shop data")
+			AutoBuy.sleep(token, 1)
+		elseif AutoBuy.selectedCount() == 0 then
+			AutoBuy.setStatus("Select items to buy")
+			AutoBuy.sleep(token, 0.5)
+		else
+			local okPass, bought, allSoldOut = pcall(AutoBuy.runPass, token)
+			if not okPass then
+				AutumnTravel.buyRequested = false
+				warn("[AutumnDice] Auto Buy error: " .. tostring(bought))
+				bought = false
+			end
+			if AutoBuy.alive(token) then
+				AutoBuy.setStatus(bought and "Waiting for the next pass" or allSoldOut and "Selected items at their purchase limits" or "Nothing bought, waiting")
+				-- during this pause the other features are free to move
+				AutoBuy.sleep(token, bought and AutoBuy.passDelay or AutoBuy.idleDelay)
+			end
+		end
+	end
+	AutoBuy.workerActive = false
+end
+
+AutoBuy.setEnabled = function(enabled)
+	AutoBuy.token += 1
+	if enabled then
+		AutoBuy.setStatus("Starting")
+		task.spawn(AutoBuy.worker, AutoBuy.token)
+	else
+		AutoBuy.setStatus("Off")
+	end
+end
+
+-- ---------------------------------------------------------------- card (Event tab, left column)
+do
+	local function shopIcon(tile)
+		-- bag: a body with a handle on top
+		create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 3),
+			Size = UDim2.fromOffset(14, 11),
+			BackgroundColor3 = THEME.accent,
+			BorderSizePixel = 0,
+			Parent = tile,
+		}, { corner(3) })
+		create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, -5),
+			Size = UDim2.fromOffset(8, 7),
+			BackgroundTransparency = 1,
+			Parent = tile,
+		}, { corner(3), stroke(THEME.accent, 2) })
+	end
+
+	local body = makeCard(eventTab.left, shopIcon, "Apple Shop", 2)
+	makeToggle(body, 1, "Auto Buy", "AutoBuy")
+
+	AutoBuy.statusLine = makeLine(body, 2, 11, THEME.subtext)
+	AutoBuy.statusLine.Text = "Off"
+
+	-- item selection uses the shared dropdown component (multi-select checklist with search)
+	AutoBuy.dropdown = makeDropdown(body, 3, {
+		label = "Items",
+		multi = true,
+		searchable = true,
+		placeholder = "Select Items...",
+		emptyText = "Loading shop items...",
+		maxHeight = 180,
+		onChange = function() AutoBuy.refresh() end,
+	})
+	AutoBuy.selected = AutoBuy.dropdown.selected -- one shared set: the pass buys what is ticked
+end
+
+table.insert(refreshers, AutoBuy.refresh)
+
+-- build the item list as soon as the shop config can be required (retries until it works)
+task.spawn(function()
+	while gui.Parent and not AutoBuy.built do
+		pcall(AutoBuy.build)
+		task.wait(1)
+	end
+end)
+
 -- Render once data loads, then refresh on changes with a slow safety-net pass.
 task.spawn(function()
 	local nextLoadTry, nextHookTry, lastRender = 0, 0, 0
@@ -2896,14 +3437,13 @@ end)
 local function initializeAutoQuest()
 -- AutoQuest: automatically works on every Autumn quest.
 --
--- 1) Apple quests (apples / rare Apples / combo / Rush): walks to the Orchard
---    and sweeps it. The game's built-in checkReach collects every apple that
---    comes within reach, so no manual clicking is needed. Apple Rushes get
---    top priority since they only last 90 seconds.
--- 2) Apple Board quests: walks to the Apple Board and buys upgrade levels
---    (spends Apples) until the quest completes.
--- 3) Leaf Dice quests: walks to the Leaf Dice stone and rolls (spends Leaves)
---    until the quest completes.
+-- 1) Apple quests (apples / rare Apples / combo / Rush): uses Shared Travel to
+--    reach the Orchard and sweep apple positions. The game's checkReach collects
+--    each apple within reach. Apple Rushes get top priority since they only last 90 seconds.
+-- 2) Apple Board quests: uses Shared Travel to reach the board area and buy
+--    upgrade levels (spends Apples) until the quest completes.
+-- 3) Leaf Dice quests: uses Shared Travel to reach the Leaf Dice stone and roll
+--    (spends Leaves) until the quest completes.
 -- 4) Tower quests (floors / 99-floor run): simulates full Turkey Tower runs
 --    using the player's actual tower team (health carries over between floors
 --    and team members rotate in, exactly like TowerClass.completeFloor) to
@@ -2914,7 +3454,6 @@ local function initializeAutoQuest()
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local PathfindingService = game:GetService("PathfindingService")
 
 local AppleConfig = require(ReplicatedStorage.Framework.Features.Autumn.AppleConfig)
 local TurkeyTowers = require(ReplicatedStorage.Framework.Features.Autumn.TurkeyTowers)
@@ -2945,7 +3484,6 @@ local CONFIG = {
 	AUTO_TOWER_RUN = true,     -- auto-run towers for floor quests
 	TOWER_PREFERENCE = "Hardest", -- "First" = easiest clearable tower, "Hardest" = best rewards
 	TOWER_START_COOLDOWN = 6,   -- seconds between start attempts (server debounce is 5)
-	WALK_TIMEOUT = 120,        -- max seconds to spend walking to a destination
 	ArriveDistance = 8,
 	BOARD_BUY_COOLDOWN = 10,   -- seconds to wait when a purchase pass buys nothing
 	DICE_RETRY_COOLDOWN = 10,  -- seconds to wait when a roll fails
@@ -3053,115 +3591,43 @@ local function isRushActive()
 end
 
 -- --------------------------------------------------------------------------
--- Movement
--- --------------------------------------------------------------------------
-
+-- Character state used by Auto Quest activities.
 local function getCharacterParts()
-	local character = player.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if humanoid and root and root:IsA("BasePart") then
-		return humanoid, root
-	end
-	return nil, nil
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if humanoid and root and root:IsA("BasePart") then
+        return humanoid, root
+    end
+    return nil, nil
+end
+local function stopWalking(humanoid)
+    if not humanoid then return end
+    pcall(function()
+        local root = humanoid.RootPart
+        if root then humanoid:MoveTo(root.Position) end
+        humanoid:Move(Vector3.zero)
+    end)
 end
 
--- Moves the humanoid toward a position; returns true once within 4 studs
--- or false on timeout. Aborts early when shouldStop() returns true. Always
--- yields at least once so callers can never spin without a frame wait.
 local function moveTowards(position, timeout, shouldStop)
-	local humanoid, root = getCharacterParts()
-	if not humanoid then
-		return false
-	end
+    local humanoid = getCharacterParts()
+    if not humanoid then return false end
 
-	local started = os.clock()
-	humanoid:MoveTo(position)
+    local started = os.clock()
+    humanoid:MoveTo(position)
+    while os.clock() - started < timeout do
+        task.wait(0.1)
+        if shouldStop and shouldStop() then
+            stopWalking(humanoid)
+            return false
+        end
 
-	while os.clock() - started < timeout do
-		task.wait(0.1)
-
-		if shouldStop and shouldStop() then
-			stopWalking(humanoid)
-			return false
-		end
-
-		local _, currentRoot = getCharacterParts()
-		if currentRoot and (currentRoot.Position - position).Magnitude <= 4 then
-			return true
-		end
-	end
-
-	return false
+        local _, root = getCharacterParts()
+        if root and (root.Position - position).Magnitude <= 4 then return true end
+    end
+    return false
 end
-
--- Walks to a destination using pathfinding (direct MoveTo as fallback).
--- Returns true when arrived, false when stopped or timed out.
-local function walkTo(destination, shouldStop)
-	local deadline = os.clock() + CONFIG.WALK_TIMEOUT
-
-	while os.clock() < deadline do
-		if shouldStop and shouldStop() then
-			local currentHumanoid = getCharacterParts()
-			stopWalking(currentHumanoid)
-			return false
-		end
-
-		local humanoid, root = getCharacterParts()
-		if not humanoid or not root then
-			task.wait(0.5)
-			continue
-		end
-
-		if (root.Position - destination).Magnitude <= 10 then
-			stopWalking(humanoid)
-			return true
-		end
-
-		-- Try to compute a path; fall back to walking straight at the target.
-		local waypoints = nil
-		local path = PathfindingService:CreatePath({
-			AgentRadius = 2.5,
-			AgentHeight = 5,
-			AgentCanJump = true,
-		})
-
-		local ok = pcall(function()
-			path:ComputeAsync(root.Position, destination)
-		end)
-
-		if ok and path.Status == Enum.PathStatus.Success then
-			waypoints = path:GetWaypoints()
-		else
-			waypoints = { { Position = destination } }
-		end
-
-		for _, waypoint in waypoints do
-			if shouldStop and shouldStop() then
-				stopWalking(humanoid)
-				return false
-			end
-
-			if waypoint.Action == Enum.PathWaypointAction.Jump then
-				local humanoid2 = getCharacterParts()
-				if humanoid2 then
-					humanoid2.Jump = true
-				end
-			end
-
-			-- If a waypoint stalls, break out and recompute the path.
-			if not moveTowards(waypoint.Position, 4, shouldStop) then
-				break
-			end
-		end
-	end
-
-	local currentHumanoid = getCharacterParts()
-	stopWalking(currentHumanoid)
-	return false
-end
-
--- --------------------------------------------------------------------------
 -- Apple Rush auto-collect
 -- --------------------------------------------------------------------------
 
@@ -3197,7 +3663,7 @@ end
 -- Keeps collecting while a rush is running with rush quests left, or while
 -- any regular apple quest (apples / rare / combo) is incomplete.
 local function shouldStopApples()
-	if not enabled or AutumnTravel.questRequested then
+	if not enabled or AutumnTravel.buyRequested then
 		return true
 	end
 
@@ -3216,36 +3682,27 @@ end
 -- collects apples automatically as they enter reach. Always yields at
 -- least once per iteration so the loop can never starve the frame.
 local function chaseApples()
-	while not shouldStopApples() do
-		task.wait(0.15)
+    while not shouldStopApples() do
+        local _, root = getCharacterParts()
+        if not root then
+            task.wait(0.15)
+            continue
+        end
 
-		local humanoid, root = getCharacterParts()
-		if not humanoid or not root then
-			continue
-		end
-
-		local applePosition = getNearestApplePosition(root.Position)
-		if applePosition then
-			-- A short hop per apple keeps the loop responsive without spamming
-			-- MoveTo every frame; checkReach collects apples near the character.
-			moveTowards(applePosition, 1, shouldStopApples)
-		end
-	end
+        local applePosition = getNearestApplePosition(root.Position)
+        if applePosition then
+            moveTowards(applePosition, 1, shouldStopApples)
+        else
+            task.wait(0.15)
+        end
+    end
 end
-
 -- --------------------------------------------------------------------------
 -- Activity: collect apples (rush + apple / rare / combo quests)
 -- --------------------------------------------------------------------------
 
 local function collectApplesActivity()
-	-- Pivot to the Orchard, then walk while collecting apples.
-	if AutumnTravel.findZone(AppleConfig.AREA_ZONE) then
-		AutumnTravel.pivotToZone(AppleConfig.AREA_ZONE, function()
-			return shouldStopApples()
-		end)
-	end
-
-	-- Sweep the Orchard until every apple quest completes.
+	-- Sweep the Orchard through Shared Travel until every apple quest completes.
 	if not shouldStopApples() then
 		chaseApples()
 	end
@@ -3255,15 +3712,16 @@ end
 -- Activity: buy Apple Board levels (spends Apples)
 -- --------------------------------------------------------------------------
 
-local function buyBoardLevelsActivity()
-	if AutumnTravel.findZone(AppleConfig.AREA_ZONE) then
-		setStatus("Board: walking to the Apple Board")
-		AutumnTravel.pivotToZone(AppleConfig.AREA_ZONE, function()
-			return not enabled or AutumnTravel.questRequested or not getRemaining(OBJECTIVES.BOARD)
-		end)
+-- waits, but returns early when Auto Buy needs the character (so the lock is freed at once)
+local function interruptibleWait(seconds)
+	local t0 = os.clock()
+	while os.clock() - t0 < seconds and enabled and not AutumnTravel.buyRequested do
+		task.wait(0.1)
 	end
+end
 
-	while enabled and not AutumnTravel.questRequested and CONFIG.AUTO_BOARD_LEVELS and getRemaining(OBJECTIVES.BOARD) do
+local function buyBoardLevelsActivity()
+	while enabled and not AutumnTravel.questRequested and not AutumnTravel.buyRequested and CONFIG.AUTO_BOARD_LEVELS and getRemaining(OBJECTIVES.BOARD) do
 		local boughtAny = false
 
 		-- Try every upgrade; the server validates unlocks, caps, and cost.
@@ -3287,7 +3745,7 @@ local function buyBoardLevelsActivity()
 		else
 			-- Out of Apples (or everything maxed): wait and retry later.
 			setStatus("Board: waiting for Apples")
-			task.wait(CONFIG.BOARD_BUY_COOLDOWN)
+			interruptibleWait(CONFIG.BOARD_BUY_COOLDOWN)
 		end
 	end
 end
@@ -3298,7 +3756,7 @@ end
 
 local function rollLeafDiceActivity()
 	local shouldContinue = function()
-		return enabled and not AutumnTravel.questRequested and getRemaining(OBJECTIVES.LEAF_ROLLS) ~= nil
+		return enabled and not AutumnTravel.questRequested and not AutumnTravel.buyRequested and getRemaining(OBJECTIVES.LEAF_ROLLS) ~= nil
 	end
 	local function ensureLeafDicePosition()
 		if not shouldContinue() then return false end
@@ -3320,7 +3778,7 @@ local function rollLeafDiceActivity()
 		return AutumnTravel.isNearZone(AutumnConfig.Zones.LeafDice, 10)
 	end
 
-	while enabled and not AutumnTravel.questRequested and CONFIG.AUTO_LEAF_ROLLS and getRemaining(OBJECTIVES.LEAF_ROLLS) do
+	while enabled and not AutumnTravel.questRequested and not AutumnTravel.buyRequested and CONFIG.AUTO_LEAF_ROLLS and getRemaining(OBJECTIVES.LEAF_ROLLS) do
 		-- Recheck immediately before each event; never roll outside the validated box.
 		if not ensureLeafDicePosition() then
 			if not shouldContinue() then break end
@@ -3340,39 +3798,83 @@ local function rollLeafDiceActivity()
 
 		if rolled then
 			setStatus("Dice: rolling")
-			task.wait(LeafDice.ROLL_DURATION + 0.1)
+			interruptibleWait(LeafDice.ROLL_DURATION + 0.1)
 		else
 			-- Out of Leaves or unit storage: wait and retry later.
 			setStatus("Dice: waiting for Leaves")
-			task.wait(CONFIG.DICE_RETRY_COOLDOWN)
+			interruptibleWait(CONFIG.DICE_RETRY_COOLDOWN)
 		end
 	end
 end
 
 -- --------------------------------------------------------------------------
-local function runQuestActivity(activity, zoneName, alwaysMove)
-	local _, root = getCharacterParts()
-	local zone = AutumnTravel.findZone(zoneName)
-	local destination = zone and zone:GetPivot().Position
-	local needsMovement = alwaysMove or (zoneName == AutumnConfig.Zones.LeafDice and not AutumnTravel.isNearZone(zoneName, 10))
-		or (destination and (not root or (root.Position - destination).Magnitude > CONFIG.ArriveDistance))
+local function withAutoQuestPriority(activity)
+    if not enabled or AutumnTravel.buyRequested then return false end
 
-	if not needsMovement then
-		local ok, err = pcall(activity)
-		if not ok then warn("[AutumnDice] Auto Quest activity failed: " .. tostring(err)) end
-		return
-	end
+    AutumnTravel.autoQuestRequestCount += 1
+    AutumnTravel.autoQuestRequested = true
 
-	AutumnTravel.autoQuestMoving = true
-	local owner = {}
-	if AutumnTravel.acquire(owner, function() return enabled and not AutumnTravel.questRequested end) then
-		local ok, err = pcall(activity)
-		AutumnTravel.release(owner)
-		if not ok then warn("[AutumnDice] Auto Quest activity failed: " .. tostring(err)) end
-	end
-	AutumnTravel.autoQuestMoving = false
+    local owner = {}
+    local acquired = AutumnTravel.acquire(owner, function()
+        return enabled and not AutumnTravel.buyRequested
+    end)
+    local ok, err = true, nil
+
+    if acquired then
+        if enabled and not AutumnTravel.buyRequested then
+            ok, err = pcall(activity)
+        end
+        AutumnTravel.release(owner)
+    end
+
+    AutumnTravel.autoQuestRequestCount = math.max(0, AutumnTravel.autoQuestRequestCount - 1)
+    AutumnTravel.autoQuestRequested = AutumnTravel.autoQuestRequestCount > 0
+
+    if not ok then
+        warn("[AutumnDice] Auto Quest activity failed: " .. tostring(err))
+    end
+    return acquired and ok
 end
 
+local function runQuestActivity(activity, zoneName, alwaysMove)
+    withAutoQuestPriority(function()
+        local shouldContinue = function()
+            return enabled and not AutumnTravel.buyRequested
+        end
+        local traveled, travelErr = AutumnTravel.ensureInAutumnWorld(shouldContinue)
+        if not traveled then
+            if shouldContinue() then warn("[AutumnDice] Auto Quest travel failed: " .. tostring(travelErr)) end
+            return
+        end
+
+        local zone = AutumnTravel.findZone(zoneName)
+        if not zone then
+            warn("[AutumnDice] Auto Quest zone not found: " .. tostring(zoneName))
+            return
+        end
+
+        local _, root = getCharacterParts()
+        local destination = zone:GetPivot().Position
+        local needsMovement = alwaysMove
+            or not root
+            or (root.Position - destination).Magnitude > CONFIG.ArriveDistance
+            or not AutumnTravel.isNearZone(zoneName, 10)
+
+        AutumnTravel.autoQuestMoving = needsMovement
+        if needsMovement then
+            local arrived, moveErr = AutumnTravel.pivotToZone(zoneName, shouldContinue, 10)
+            if not arrived then
+                AutumnTravel.autoQuestMoving = false
+                if shouldContinue() then warn("[AutumnDice] Auto Quest movement failed: " .. tostring(moveErr)) end
+                return
+            end
+        end
+
+        local ok, err = pcall(activity)
+        AutumnTravel.autoQuestMoving = false
+        if not ok then warn("[AutumnDice] Auto Quest activity failed: " .. tostring(err)) end
+    end)
+end
 -- Master scheduler
 -- --------------------------------------------------------------------------
 
@@ -3382,7 +3884,7 @@ task.spawn(function()
 	while true do
 		task.wait(1)
 
-		if not enabled or AutumnTravel.questRequested then
+		if not enabled or AutumnTravel.buyRequested then
 			continue
 		end
 
@@ -3391,7 +3893,7 @@ task.spawn(function()
 			setStatus(("Rush: %d apples to go"):format(remaining))
 			runQuestActivity(collectApplesActivity, AppleConfig.AREA_ZONE, true)
 		elseif CONFIG.AUTO_BOARD_LEVELS and getRemaining(OBJECTIVES.BOARD) then
-			runQuestActivity(buyBoardLevelsActivity, AppleConfig.AREA_ZONE)
+			runQuestActivity(buyBoardLevelsActivity, AppleConfig.AREA_ZONE, true)
 		elseif CONFIG.AUTO_LEAF_ROLLS and getRemaining(OBJECTIVES.LEAF_ROLLS) then
 			runQuestActivity(rollLeafDiceActivity, AutumnConfig.Zones.LeafDice)
 		elseif CONFIG.AUTO_APPLES and getRemaining(OBJECTIVES.APPLES) then
@@ -3657,9 +4159,11 @@ task.spawn(function()
 		end
 
 		if section then
-			if tryStartTower(section) then
-				setTowerStatus(("Tower: running %s"):format(section.name))
-			end
+			withAutoQuestPriority(function()
+				if tryStartTower(section) then
+					setTowerStatus(("Tower: running %s"):format(section.name))
+				end
+			end)
 		else
 			setTowerStatus(("Tower: waiting (%s)"):format(reason or "none"))
 		end
@@ -3682,6 +4186,9 @@ local function Unload()
 	setAutoReconnect(false)
 	uninstallFloorHook()
 	unhookQuests()
+	if AutoBuy.setEnabled then AutoBuy.setEnabled(false) end
+	State.Features.AutoBuy = false
+	AutumnTravel.buyRequested = false
 	setAutoClaim(false)
 	setAutoQuest(false)
 	State.Features.AutoQuest = false
@@ -3691,6 +4198,7 @@ local function Unload()
 	runId += 1
 	towerRunId += 1
 	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs(AutoBuy.dataHooks) do pcall(function() c:Disconnect() end) end
 	if gui then gui:Destroy() end
 	env.AutumnDice = nil
 end
@@ -3710,10 +4218,10 @@ env.AutumnDice = {
 }
 
 ----------------------------------------------------------------------
--- Defaults: Anti AFK, Auto Reconnect and Auto Roll start ON. SetFeature starts the real
+-- Defaults: Anti AFK and Auto Roll start ON. SetFeature starts the real
 -- behavior, and the toggles follow State.
 ----------------------------------------------------------------------
-for _, name in ipairs({ "AntiAfk", "AutoReconnect", "AutoDice" }) do
+for _, name in ipairs({ "AntiAfk", "AutoDice" }) do
 	SetFeature(name, true)
 end
 
