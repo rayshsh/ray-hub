@@ -2371,8 +2371,6 @@ local rollInfo = create("Frame", {
 
 local rollResultsLine = makeLine(rollInfo, 1, 11, THEME.subtext)
 rollResultsLine.Text = "Results: None yet"
-local rollCount = makeLine(rollInfo, 1, 12, THEME.subtext)
-local leafBalance = makeLine(rollInfo, 2, 12, THEME.subtext)
 local rollCount = makeLine(rollInfo, 2, 12, THEME.subtext)
 local leafBalance = makeLine(rollInfo, 3, 12, THEME.subtext)
 local leafBalanceValue = 0
@@ -3680,7 +3678,6 @@ local function refreshGui()
 	for _, fn in ipairs(refreshers) do fn() end
 
 	-- Auto Roll
-	-- each successful Roll call rolls CONFIG.RollAmount dice
 	-- State.Rolls counts dice returned by successful Roll calls.
 	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls))
 	leafBalance.Text = ("Leaf Balance: %s"):format(formatNumber(leafBalanceValue))
