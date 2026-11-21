@@ -98,6 +98,7 @@ local State = {
 	Detail = "Enable \"Auto Roll Autumn Dice\" to start.",
 	Hotkey = CONFIG.DefaultHotkey,
 	Rolls = 0,
+	RollResultPool = {},
 
 	TowerMode = "Best Leaf Tower",
 	SelectedTower = nil,
@@ -354,7 +355,7 @@ function AutumnTravel.ensureInAutumnWorld(shouldContinue)
 	if not AutumnTravel.isInAutumnWorld() then return finish(false, "Timed out waiting for Autumn World.") end
 	return finish(true)
 end
-function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
+function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin, destinationOffset)
     local zone = AutumnTravel.findZone(zoneName)
     if not zone then return false, "Zone not found: " .. tostring(zoneName) end
     local root = getHRP(15)
@@ -364,6 +365,7 @@ function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
     local offsets = zoneName == "LeafDice"
         and { Vector3.zero, Vector3.new(12, 0, 0), Vector3.new(-12, 0, 0), Vector3.new(0, 0, 12), Vector3.new(0, 0, -12) }
         or { Vector3.zero, Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0), Vector3.new(0, 0, 3), Vector3.new(0, 0, -3) }
+    if destinationOffset then table.insert(offsets, 1, destinationOffset) end
     local character = player.Character
     local rootOffset = character:GetPivot():ToObjectSpace(root.CFrame)
     for _, offset in ipairs(offsets) do
@@ -379,7 +381,9 @@ function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
         end
     end
     return false, "Could not verify arrival at zone: " .. tostring(zoneName)
-end----------------------------------------------------------------------
+end
+
+----------------------------------------------------------------------
 -- AUTO ROLL
 ----------------------------------------------------------------------
 local runId = 0               -- bumped on every start/stop; stale workers exit
@@ -472,7 +476,7 @@ local function runSetup(id, owner)
 		SetStatus("Moving")
 		moved, err = AutumnTravel.pivotToZone("LeafDice", function()
 			return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested
-		end, 10)
+		end, 10, Vector3.new(12, 0, 0))
 		if moved then break end
 
 		AutumnTravel.release(owner)
@@ -492,6 +496,20 @@ local function isAtLeafDice()
 	return AutumnTravel.isNearZone("LeafDice", 10)
 end
 
+local function poolRollResults(results)
+	for _, entry in ipairs(results) do
+		if type(entry) == "table" and entry.result ~= nil then
+			local unitId = tostring(entry.result)
+			local counts = State.RollResultPool[unitId]
+			if not counts then
+				counts = { total = 0 }
+				State.RollResultPool[unitId] = counts
+			end
+			counts.total += 1
+
+		end
+	end
+end
 local function rollLoop(id, rollRemote)
 	local consecutiveErrors = 0
 	State.Rolls = 0
@@ -510,7 +528,7 @@ local function rollLoop(id, rollRemote)
 				local moved, err = true, nil
 				if not isAtLeafDice() then
 					SetStatus("Moving", "Returning to the LeafDice zone before rolling.")
-					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested end, 10)
+					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested end, 10, Vector3.new(12, 0, 0))
 				end
 				if not moved or not isAtLeafDice() then
 					AutumnTravel.release(owner)
@@ -529,11 +547,17 @@ local function rollLoop(id, rollRemote)
 					if not called then ok, result = false, ok end
 					if not alive(id) then return end
 
-					if ok and result ~= false then
+					if ok and type(result) == "table" then
+						local rolledCount = math.max(#result, 1)
 						consecutiveErrors = 0
-						State.Rolls += 1
+						poolRollResults(result)
+						State.Rolls += rolledCount
 						SetStatus("AutoRollEnabled", ("The custom rolling loop is active. Rolls completed: %d"):format(State.Rolls))
 						if not sleep(id, CONFIG.RollDelay) then return end
+					elseif ok then
+						local reason = result == nil and "rejected by server" or ("rejected by server: " .. tostring(result))
+						SetStatus("Error", reason .. " (not counted toward MaxRollErrors)")
+						if not sleep(id, CONFIG.RollErrorDelay) then return end
 					else
 						consecutiveErrors += 1
 						local msg = ("Roll failed (%d/%d): %s"):format(consecutiveErrors, CONFIG.MaxRollErrors, tostring(result))
@@ -2341,8 +2365,10 @@ local rollInfo = create("Frame", {
 	Parent = rollBody,
 }, { vlist(4) })
 
-local rollCount = makeLine(rollInfo, 1, 12, THEME.subtext)
-local leafBalance = makeLine(rollInfo, 2, 12, THEME.subtext)
+local rollResultsLine = makeLine(rollInfo, 1, 11, THEME.subtext)
+rollResultsLine.Text = "Results: None yet"
+local rollCount = makeLine(rollInfo, 2, 12, THEME.subtext)
+local leafBalance = makeLine(rollInfo, 3, 12, THEME.subtext)
 local leafBalanceValue = 0
 local leafBalanceHooked = false
 task.spawn(function()
@@ -3435,9 +3461,15 @@ local function refreshGui()
 	for _, fn in ipairs(refreshers) do fn() end
 
 	-- Auto Roll
-	-- each successful Roll call rolls CONFIG.RollAmount dice
-	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls * CONFIG.RollAmount))
+	-- State.Rolls counts dice returned by successful Roll calls.
+	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls))
 	leafBalance.Text = ("Leaf Balance: %s"):format(formatNumber(leafBalanceValue))
+	local pooledResults = {}
+	for unitId, counts in pairs(State.RollResultPool) do
+		table.insert(pooledResults, ("%s x%d"):format(unitId, counts.total))
+	end
+	table.sort(pooledResults)
+	rollResultsLine.Text = "Results: " .. (#pooledResults > 0 and table.concat(pooledResults, ", ") or "None yet")
 
 	-- Auto Tower
 	local S = State.TowerStats
