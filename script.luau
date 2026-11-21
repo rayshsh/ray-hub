@@ -1,16 +1,8 @@
-----------------------------------------------------------------------
--- Services
-----------------------------------------------------------------------
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 
-----------------------------------------------------------------------
--- Startup gate: do NOTHING until the game has fully loaded.
--- After a rejoin / server hop the script can be executed while the game is still starting,
--- and touching its modules, remotes or UI that early can break the game's own loading.
-----------------------------------------------------------------------
-local STARTUP_DELAY = 6   -- extra seconds of grace once everything below is ready
+local STARTUP_DELAY = 6   
 do
 	if not game:IsLoaded() then game.Loaded:Wait() end
 
@@ -21,7 +13,7 @@ do
 	end
 
 	lp:WaitForChild("PlayerGui")
-	ReplicatedStorage:WaitForChild("Framework", 60) -- the game's own controllers live here
+	ReplicatedStorage:WaitForChild("Framework", 60) 
 
 	local deadline = os.clock() + 30
 	while not lp.Character and os.clock() < deadline do
@@ -38,22 +30,17 @@ end
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
--- Clean up a previous instance if the script is executed twice
 if env.AutumnDice and env.AutumnDice.Unload then
 	pcall(env.AutumnDice.Unload)
 end
 
-----------------------------------------------------------------------
--- Config
-----------------------------------------------------------------------
 local CONFIG = {
-		DefaultHotkey = Enum.KeyCode.LeftControl,
+	DefaultHotkey = Enum.KeyCode.LeftControl,
 
-	-- Auto Roll
-	RollAmount = 5,           -- argument passed to LeafDiceService.RF.Roll
-	RollDelay = 0.2,          -- seconds to wait AFTER a roll finishes, before the next one
-	MaxRollErrors = 5,        -- consecutive failed rolls before the loop stops itself
-	RollErrorDelay = 3,       -- seconds to wait after a failed roll before trying again
+	RollAmount = 5,           
+	RollDelay = 0.1,          
+	MaxRollErrors = 5,        
+	RollErrorDelay = 3,       
 
 	RemoteWaitTimeout = 10,
 	InvokeTimeout = 15,
@@ -62,36 +49,21 @@ local CONFIG = {
 
 	ArriveDistance = 8,
 
-	-- Auto Tower
-	TowerRestartCooldown = 3, -- minimum seconds between tower start attempts
-	TowerTickInterval = 1,    -- seconds between tower checks
-	-- Best Leaf Tower: which eligible tower to pick. An eligible tower is unlocked AND its floor 1
-	-- can be defeated by the best owned unit.
-	--   "MostAdvanced" = the last eligible section in progression order
-	--   "First"        = the first eligible section in progression order
+	TowerRestartCooldown = 3, 
+	TowerTickInterval = 1,    
 	BestTowerPreference = "MostAdvanced",
-	BestReevalInterval = 30,  -- when run state is unknown: hold the choice this long after a start
-	EquipDelay = 1,           -- seconds to wait after firing EquipBestTowerTeam, before starting the tower
-	EquipOnProbe = false,     -- when run state is unknown, also equip on "is it still running?" retries
-
-	-- Optional: set this to your game's own "is a tower run active?" check.
-	-- It must return true (run active) or false (no run). Leave nil to use auto-detection.
-	--   IsRunActive = function() return SomeController.inRun() end,
+	BestReevalInterval = 30,
+	EquipDelay = 1,
+	EquipOnProbe = false,
 	IsRunActive = nil,
 
-	-- Auto-detection looks for these functions on TowerController (only if they exist).
 	RunActiveCandidates = { "isInTower", "isRunning", "isInRun", "hasActiveRun" },
 }
 
 local TOWER_MODES = { "Single", "Best Leaf Tower" }
-
-----------------------------------------------------------------------
--- State (single source of truth; GUI listens to it)
-----------------------------------------------------------------------
 local State = {
 	Features = {
 		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false, AutoBuy = false, AutoPotion = false,
-		-- Miscellaneous
 		AntiAfk = false, AutoReconnect = false, AutoClaimQuest = false,
 	},
 	Status = "Idle",
@@ -106,12 +78,12 @@ local State = {
 	TowerDetail = "Auto Tower is disabled.",
 
 	TowerStats = {
-		Runs = 0,          -- tower runs started (any start, via TowerController.startTower)
-		Floors = 0,        -- floors cleared since the script started
-		Best = 0,          -- highest floor seen
-		Floor = nil,       -- current floor of the run (nil = no data yet)
-		LastFloor = nil,   -- internal: previous floor shown by the game's Floor label
-		Tracking = false,  -- true once the Floor label has been read
+		Runs = 0,          
+		Floors = 0,        
+		Best = 0,          
+		Floor = nil,      
+		LastFloor = nil,  
+		Tracking = false, 
 	},
 }
 
@@ -123,7 +95,6 @@ local function notify()
 	end
 end
 
--- Auto Roll statuses
 local STATUS = {
 	Idle             = { text = "Idle",               color = Color3.fromRGB(150, 150, 160) },
 	Initializing     = { text = "Initializing",       color = Color3.fromRGB(120, 170, 255) },
@@ -154,7 +125,6 @@ local function SetStatus(key, detail)
 	notify()
 end
 
--- Auto Tower statuses
 local BLUE = Color3.fromRGB(120, 170, 255)
 local GREEN = Color3.fromRGB(90, 215, 120)
 local YELLOW = Color3.fromRGB(255, 200, 80)
@@ -185,9 +155,6 @@ local function SetTowerStatus(key, detail)
 	notify()
 end
 
-----------------------------------------------------------------------
--- Helpers
-----------------------------------------------------------------------
 local function getRemote(path, timeout, shouldContinue)
     local node = ReplicatedStorage
     for _, name in ipairs(path) do
@@ -213,8 +180,6 @@ local function pathString(path)
 	return "ReplicatedStorage." .. table.concat(path, ".")
 end
 
--- InvokeServer with a timeout. `inFlight` stays set until the server really answers,
--- so a new call on the same remote is never started while an old one is pending.
 local inFlight = {}
 local function invoke(remote, ...)
 	local args = table.pack(...)
@@ -262,7 +227,7 @@ local function getHRP(timeout)
 end
 
 local AutumnTravel = { travelRemote = nil, traveling = false, movementOwner = nil, questRequested = false, autoQuestMoving = false, autoQuestRequested = false, autoQuestRequestCount = 0,
-	buyRequested = false } -- buyRequested: Auto Buy has absolute movement priority
+	buyRequested = false } 
 
 local function canContinue(shouldContinue)
 	return not shouldContinue or shouldContinue()
@@ -383,11 +348,9 @@ function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin, destinationO
     return false, "Could not verify arrival at zone: " .. tostring(zoneName)
 end
 
-----------------------------------------------------------------------
--- AUTO ROLL
-----------------------------------------------------------------------
-local runId = 0               -- bumped on every start/stop; stale workers exit
-local workerActive = false    -- true while a roll worker exists (guarantees a single loop)
+
+local runId = 0               
+local workerActive = false   
 
 local function alive(id)
 	return runId == id and State.Features.AutoDice
@@ -449,7 +412,6 @@ local function runSetup(id, owner)
 	end
 	if not sleep(id, CONFIG.StepDelay) then return nil end
 
-	-- 1. Ensure arrival in Autumn World
 	SetStatus("Teleporting")
 	local traveled, travelErr = AutumnTravel.ensureInAutumnWorld(function() return alive(id) and rollPriorityAllows() end)
 	if not alive(id) or not rollPriorityAllows() then return nil end
@@ -458,8 +420,6 @@ local function runSetup(id, owner)
 	end
 	if not sleep(id, CONFIG.TeleportSettle) then return nil end
 
-	
-	-- 2. Sync the player
 	if not rollPriorityAllows() then return nil end
 	SetStatus("Syncing")
 	local ok, res = invoke(remotes.sync)
@@ -469,7 +429,6 @@ local function runSetup(id, owner)
 	end
 	if not sleep(id, CONFIG.StepDelay) then return nil end
 
-	-- 3. Pivot into the LeafDice zone, yielding the movement lease to quest workers.
 	local moved, err = false, nil
 	while alive(id) do
 		if not acquireRollMovement(id, owner) then return nil end
@@ -606,10 +565,7 @@ local function worker(id)
 	end
 	workerActive = false
 end
-----------------------------------------------------------------------
--- AUTO TOWER
-----------------------------------------------------------------------
--- Existing references (loaded lazily so a missing module shows an Error instead of crashing)
+
 local TurkeyTowers, Towers, TowerController, DataController, BuffController, EntryRegistry
 local RESTART_COOLDOWN = CONFIG.TowerRestartCooldown
 
@@ -618,20 +574,20 @@ local Tower = {
 	lastLoadTry = -math.huge,
 	loadError = nil,
 
-	names = {},               -- current tower names from Towers.GetAll()
+	names = {},               
 	options = {},
 	displayByName = {},
 	optionToName = {},
 	catalog = {},
-	activeName = nil,         -- tower the monitor is currently handling
-	lastStarted = false,      -- last start attempt for activeName succeeded / run assumed active
-	lockedSince = 0,          -- time of the last successful start (holds the Best Leaf Tower choice)
-	bestExtra = nil,          -- detail text of the current Best Leaf Tower choice (best unit)
+	activeName = nil,         
+	lastStarted = false,      
+	lockedSince = 0,          
+	bestExtra = nil,          
 
-	selectionEpoch = 0,       -- bumped when mode / tower / Auto Tower changes (cancels a pending start)
-	startInFlight = false,    -- prevents duplicate start attempts
-	workerActive = false,     -- prevents duplicate monitoring loops
-	wake = false,             -- ask the loop to re-evaluate right away (mode / tower changed)
+	selectionEpoch = 0,       
+	startInFlight = false,    
+	workerActive = false,     
+	wake = false,             
 }
 
 local towerRunId = 0
@@ -666,10 +622,6 @@ local function loadTowerModules()
 	return true
 end
 
--- --------------------------------------------------------------------------
--- Data helpers (reused)
--- --------------------------------------------------------------------------
-
 local function getMilestones()
 	if not DataController then return nil end
 	local ok, result = pcall(function()
@@ -693,14 +645,6 @@ local function findSectionByName(name)
 	return nil
 end
 
--- --------------------------------------------------------------------------
--- Combat calculation (best owned unit vs. a tower floor)
--- --------------------------------------------------------------------------
-
--- Finds the player's best unit (highest damage), mirroring the server's
--- EquipBestTowerTeam ranking logic.
--- Returns { key, name, damage, health }, or nil + reason:
---   "unavailable" = inventory / registry not readable yet, "none" = no units owned
 local function getBestUnit()
 	if not DataController or not EntryRegistry then
 		return nil, "unavailable"
@@ -740,7 +684,6 @@ local function getBestUnit()
 	return nil, "none"
 end
 
--- Buff multiplier with a safe default (a missing buff counts as x1)
 local function getBuff(name)
 	local ok, value = pcall(function()
 		return BuffController.GetBuff(name)
@@ -751,9 +694,6 @@ local function getBuff(name)
 	return 1
 end
 
--- Simulates one floor fight using the game's combat rules (TowerClass.completeFloor):
--- the unit strikes first; if the enemy survives, it hits back. Repeats until the enemy
--- dies or the unit runs out of health.
 local function canDefeatFloor(section, floor, unit)
 	local ok, enemyHealth, enemyDamage = pcall(function()
 		return TurkeyTowers.EnemyHealth(section, floor), TurkeyTowers.EnemyDamage(section, floor)
@@ -762,23 +702,19 @@ local function canDefeatFloor(section, floor, unit)
 		return false
 	end
 
-	-- Effective stats, same as the server computes them
 	local damage = unit.damage * getBuff("Damage Multiplier")
 	local health = (unit.health or 0) * getBuff("Health Multiplier")
 
 	if damage <= 0 then
-		return false -- unit can never kill the enemy
+		return false 
 	end
 
-	-- Turns needed to bring the enemy to 0 HP. The unit always strikes first, so it only
-	-- takes damage on the turns where the enemy is still alive afterwards.
 	local turnsNeeded = math.ceil(enemyHealth / damage)
 	local damageTaken = (turnsNeeded - 1) * enemyDamage
 
 	return health > damageTaken
 end
 
--- Convenience: can the player's best unit clear floor 1 (every run starts at floor 1)?
 local function canBestUnitDefeatFloor(section, floor)
 	local bestUnit = getBestUnit()
 	if not bestUnit then
@@ -788,16 +724,8 @@ local function canBestUnitDefeatFloor(section, floor)
 	return canDefeatFloor(section, floor or 1, bestUnit)
 end
 
--- --------------------------------------------------------------------------
--- Selection logic - two separate modes
--- --------------------------------------------------------------------------
+local isRunActive 
 
-local isRunActive -- defined in "Tower control" below
-
--- Best Leaf Tower: walks TurkeyTowers.Sections in progression order and keeps the unlocked
--- sections whose floor 1 the best unit can defeat. Tower progress (TurkeyBest / 100/100)
--- is NOT used here.
--- Returns: section, unit  |  nil, reason ("unavailable" | "nounit" | "none")
 local function findNextSection()
 	local milestones = getMilestones()
 	if not milestones then
@@ -826,9 +754,6 @@ local function findNextSection()
 	return nil, "none"
 end
 
--- While a run is in progress the current Best Leaf Tower choice is kept (no recalculation,
--- no switching). With unknown run state it is held for CONFIG.BestReevalInterval seconds
--- after a successful start.
 local function currentRunLocked()
 	if not Tower.activeName then
 		return false
@@ -844,7 +769,6 @@ local function currentRunLocked()
 	return false
 end
 
--- Returns: section, nil, extraDetail  |  nil, statusKey, detail
 local function selectBest()
 	if currentRunLocked() then
 		local locked = findSectionByName(Tower.activeName)
@@ -867,8 +791,6 @@ local function selectBest()
 	return nil, "NoTowers", "The best unit cannot defeat floor 1 of any unlocked tower."
 end
 
--- Single: the tower chosen in the "Select Tower" dropdown.
--- Only checks that the tower exists and is unlocked. Completion (100/100) is NEVER used here.
 local function selectSingle(milestones)
 	local name = State.SelectedTower
 	if type(name) ~= "string" or name == "" then
@@ -895,11 +817,7 @@ local function selectSingle(milestones)
 	end
 	return nil, "Error", ("\"%s\" is not an available tower."):format(name)
 end
--- --------------------------------------------------------------------------
--- Tower control (shared by both modes)
--- --------------------------------------------------------------------------
 
--- true = a run is active, false = no run, nil = cannot tell
 function isRunActive()
 	if CONFIG.IsRunActive then
 		local ok, result = pcall(CONFIG.IsRunActive)
@@ -924,7 +842,6 @@ function isRunActive()
 	return nil
 end
 
--- Auto Equip Best Unit: fires Towers.EquipBestTowerTeam (signal is created once and cached)
 local Equip = { signal = nil }
 
 local function getEquipSignal()
@@ -960,8 +877,6 @@ local function equipBestTeam()
 	return true
 end
 
--- Returns: started(boolean), reason ("cooldown" | "busy" | "cancelled" | "declined" | "equip failed: ..." | "error: ...")
--- doEquip: equip the best team first (only ever done here, i.e. once per start attempt)
 local function tryStartTower(section, doEquip)
 	if Tower.startInFlight then
 		return false, "busy"
@@ -983,10 +898,8 @@ local function tryStartTower(section, doEquip)
 			return false, "equip failed: " .. tostring(equipErr)
 		end
 
-		-- give the equip change time to be processed before entering the tower
 		task.wait(CONFIG.EquipDelay)
 
-		-- Auto Tower was turned off, or the mode / tower changed, while waiting: do not start
 		if not State.Features.AutoTower or Tower.selectionEpoch ~= epoch then
 			Tower.startInFlight = false
 			return false, "cancelled"
@@ -1005,8 +918,6 @@ local function tryStartTower(section, doEquip)
 	return false, "error: " .. tostring(result)
 end
 
--- Starts (or keeps monitoring) the given tower. Used by BOTH modes.
--- `extra` is optional detail text shown after the tower name (e.g. the best unit).
 local function driveTower(mode, section, extra)
 	local single = (mode == "Single")
 	local progressKey = single and "SingleProgress" or "BestProgress"
@@ -1018,7 +929,6 @@ local function driveTower(mode, section, extra)
 		Tower.lastStarted = false
 	end
 
-	-- never start another tower while a run is active
 	local active = isRunActive()
 	if active == true then
 		Tower.lastStarted = true
@@ -1026,15 +936,11 @@ local function driveTower(mode, section, extra)
 		return
 	end
 
-	-- still inside the restart cooldown: keep showing the right state, do nothing else
 	if Tower.startInFlight or os.clock() - lastAttemptTime < RESTART_COOLDOWN then
 		SetTowerStatus(Tower.lastStarted and progressKey or startKey, detail)
 		return
 	end
 
-	-- Equip the best team before this start attempt. If a run is known to be idle, always equip.
-	-- If run state is unknown and a run is assumed active, this attempt is only a "probe"
-	-- (startTower declines while a run is active), so it does not re-equip (see CONFIG.EquipOnProbe).
 	local wasRunning = Tower.lastStarted
 	local doEquip = State.Features.AutoEquipBest
 		and (active == false or not wasRunning or CONFIG.EquipOnProbe)
@@ -1053,7 +959,6 @@ local function driveTower(mode, section, extra)
 		if active == false then
 			SetTowerStatus("Error", ("%s: the game declined to start the tower."):format(section.name))
 		else
-			-- cannot tell whether a run is active; a declined start usually means one is
 			Tower.lastStarted = true
 			SetTowerStatus(progressKey, detail .. " (start declined, run likely active)")
 		end
@@ -1076,7 +981,6 @@ local function towerTick()
 	if mode == "Single" then
 		section, key, detail = selectSingle(getMilestones())
 	else
-		-- Best Leaf Tower mode: best unit vs. floor 1 (see findNextSection)
 		mode = "Best Leaf Tower"
 		section, key, detail = selectBest()
 	end
@@ -1087,11 +991,9 @@ local function towerTick()
 		return
 	end
 
-	-- on success, `detail` is optional extra text (Best Leaf Tower: the best unit); nil in Single
 	driveTower(mode, section, detail)
 end
 
--- The one and only monitoring loop
 local function towerWorker(id)
 	while Tower.workerActive do
 		if not towerAlive(id) then return end
@@ -1107,7 +1009,6 @@ local function towerWorker(id)
 			SetTowerStatus("Error", tostring(err))
 		end
 
-		-- wait for the next tick, but react immediately to a mode / tower change
 		local t0 = os.clock()
 		while towerAlive(id) and not Tower.wake and os.clock() - t0 < CONFIG.TowerTickInterval do
 			task.wait(0.05)
@@ -1148,17 +1049,6 @@ local function SetSelectedTower(name)
 	notify()
 end
 
-----------------------------------------------------------------------
--- Feature control (used by the GUI and by other scripts)
-----------------------------------------------------------------------
-----------------------------------------------------------------------
--- ANTI AFK
--- 1) Disables the game's own idle-rejoin timer (the AFK LocalScript reads the
---    "AFKRejoinEnabled" player attribute; false cancels its pending rejoin).
--- 2) Answers Roblox's ~20 minute idle kick: Player.Idled fires, and we respond
---    with a jump plus a VirtualUser click so the idle timer resets.
--- While disabled there is no connection and the game's attribute is restored.
-----------------------------------------------------------------------
 local AntiAfk = { conn = nil, attrConn = nil, prevAttr = nil, savedAttr = false }
 
 local function antiAfkClick()
@@ -1184,7 +1074,7 @@ local function setAntiAfk(enabled)
 			AntiAfk.attrConn:Disconnect()
 			AntiAfk.attrConn = nil
 		end
-		-- hand the game's own rejoin timer back
+		
 		if AntiAfk.savedAttr and lp then
 			pcall(function() lp:SetAttribute("AFKRejoinEnabled", AntiAfk.prevAttr) end)
 		end
@@ -1195,11 +1085,10 @@ local function setAntiAfk(enabled)
 
 	if not lp then
 		warn("[AutumnDice] Anti AFK unavailable: LocalPlayer not ready")
-		State.Features.AntiAfk = false -- keep the toggle truthful
+		State.Features.AntiAfk = false
 		return
 	end
 
-	-- disable the game's own idle-rejoin timer and keep it disabled
 	pcall(function()
 		if not AntiAfk.savedAttr then
 			AntiAfk.prevAttr = lp:GetAttribute("AFKRejoinEnabled")
@@ -1213,23 +1102,17 @@ local function setAntiAfk(enabled)
 		end)
 	end)
 
-	-- answer the idle kick with a jump and a click
 	AntiAfk.conn = lp.Idled:Connect(function(timeIdled)
 		antiAfkClick()
 	end)
 end
 
-----------------------------------------------------------------------
--- AUTO RECONNECT
--- DISABLED: implementation removed. The GUI toggle is kept as a visual-only placeholder;
--- setAutoReconnect is a no-op so SetFeature / Unload keep working.
-----------------------------------------------------------------------
 local function setAutoReconnect(enabled)
-	-- intentionally empty: no connections, no saved server, no teleports
+	
 end
 local setAutoClaim
-local AutoBuy = {} -- filled in by the Auto Buy section (Event tab)
-local AutoPotion = {} -- filled in by the Potion tab
+local AutoBuy = {} 
+local AutoPotion = {} 
 local setAutoQuest
 
 local function SetFeature(name, value)
@@ -1245,7 +1128,7 @@ local function SetFeature(name, value)
 			SetStatus("Initializing")
 			task.spawn(worker, id)
 		else
-			-- any in-flight roll finishes on its own, but no new roll is started
+			
 			SetStatus("AutoRollDisabled")
 		end
 	elseif name == "AutoTower" then
@@ -1284,12 +1167,6 @@ local function GetFeature(name)
 	return State.Features[name]
 end
 
-----------------------------------------------------------------------
--- TOWER STATS (Runs / Floors Cleared / Best Floor)
--- Floors come from the game's own Floor label ("Floor N"): every increase counts as cleared
--- floors, a drop means a new run began. Runs are counted by wrapping
--- TowerController.startTower (successful starts only, manual ones included).
-----------------------------------------------------------------------
 local FloorTracker = { label = nil, labelConn = nil, original = nil, wrapped = false, alive = true }
 
 local function readFloorText(text)
@@ -1307,7 +1184,7 @@ local function updateFloor()
 		if floor > S.LastFloor then
 			S.Floors += floor - S.LastFloor
 		elseif floor < S.LastFloor then
-			S.LastFloor = nil -- the floor counter reset: a new run began
+			S.LastFloor = nil 
 		end
 	end
 	S.Best = math.max(S.Best, floor)
@@ -1366,7 +1243,6 @@ local function uninstallFloorHook()
 	end
 end
 
--- the game's modules / UI may not exist yet: keep trying until both are hooked
 task.spawn(function()
 	while FloorTracker.alive do
 		local labelOk = connectFloorLabel()
@@ -1376,9 +1252,6 @@ task.spawn(function()
 	end
 end)
 
-----------------------------------------------------------------------
--- GUI
-----------------------------------------------------------------------
 local TweenService = game:GetService("TweenService")
 
 local function create(class, props, children)
@@ -1420,7 +1293,6 @@ local function formatNumber(n)
 	return r .. frac
 end
 
--- V-shaped chevron drawn from two bars; Rotation = 180 turns it upside down
 local function makeChevron(parent, position, color)
 	local box = create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -1471,7 +1343,7 @@ end
 local gui = create("ScreenGui", {
 	Name = "AutumnDiceAutoRoll",
 	ResetOnSpawn = false,
-	IgnoreGuiInset = true, -- keeps AbsolutePosition == Position (dropdown popups rely on it)
+	IgnoreGuiInset = true, 
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
 pcall(function() gui.Parent = resolveParent() end)
@@ -1484,7 +1356,7 @@ local main = create("Frame", {
 	Name = "Main",
 	AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromOffset(380, 460), -- real size comes from applyLayout() (screen based)
+	Size = UDim2.fromOffset(380, 460),
 	BackgroundColor3 = THEME.bg,
 	BorderSizePixel = 0,
 	Parent = gui,
@@ -1494,7 +1366,6 @@ local main = create("Frame", {
 	pad(8, 6, 8, 8),
 })
 
--- Title bar (drag handle) ---------------------------------------------------
 local titleBar = create("Frame", {
 	LayoutOrder = 1,
 	Size = UDim2.new(1, 0, 0, 20),
@@ -1532,10 +1403,8 @@ for _, rot in ipairs({ 45, -45 }) do
 	}, { create("UICorner", { CornerRadius = UDim.new(1, 0) }) })
 end
 
--- Dropdown popup infrastructure ---------------------------------------------
 local openDropdown = nil
 
--- invisible layer behind an open list: clicking it closes the list
 local catcher = create("TextButton", {
 	Size = UDim2.fromScale(1, 1),
 	BackgroundTransparency = 1,
@@ -1555,12 +1424,9 @@ local function closeDropdowns()
 end
 catcher.MouseButton1Click:Connect(closeDropdowns)
 
--- Building blocks -------------------------------------------------------------
 
--- Layout: side navigation (left) + one page per tab (right) ----------------
 local SIDEBAR_GAP = 8
 
--- fills the space between the title bar (top) and the footer (bottom)
 local bodyRow = create("Frame", {
 	Position = UDim2.fromOffset(0, 26),
 	Size = UDim2.new(1, 0, 1, -52),
@@ -1579,7 +1445,6 @@ local sidebar = create("ScrollingFrame", {
 	Parent = bodyRow,
 }, { corner(10), stroke(THEME.stroke), pad(6, 6, 6, 6), vlist(4) })
 
--- the tab pages live in here; it scrolls whenever a page is taller than the window
 local content = create("ScrollingFrame", {
 	Position = UDim2.fromOffset(208 + SIDEBAR_GAP, 0),
 	Size = UDim2.new(1, -(208 + SIDEBAR_GAP), 1, 0),
@@ -1593,8 +1458,6 @@ local content = create("ScrollingFrame", {
 	Parent = bodyRow,
 }, { pad(0, 0, 6, 0) })
 
--- Two-column container: two equal columns side by side on wide windows, stacked on narrow ones.
--- Equal widths come from 0.5 scale minus half the gap, so the columns stay even and aligned.
 local COLUMN_GAP = 10
 local twoColumnMode = false
 local columnSets = {}
@@ -1633,8 +1496,6 @@ local function makeColumns(parent, order)
 	return set
 end
 
--- Two equal columns when the window is wide enough (a lone card keeps its half width);
--- stacked into one column otherwise
 local function layoutColumnSet(set)
 	local two = twoColumnMode
 	set.layout.FillDirection = two and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
@@ -1652,7 +1513,6 @@ local function setColumnMode(two)
 	refreshColumns()
 end
 
--- Responsive window: sized from the screen, never from the content
 local function applyLayout()
 	local cam = workspace.CurrentCamera
 	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
@@ -1660,7 +1520,6 @@ local function applyLayout()
 	local h = math.min(math.clamp(math.floor(vp.Y * 0.75), 220, 580), vp.Y - 16)
 	local sideW = (w >= 340) and 208 or 176
 
-	-- two cards side by side only when each card would still be wide enough to read
 	local contentW = w - 16 - (sideW + SIDEBAR_GAP) - 6
 	setColumnMode(contentW >= 380)
 
@@ -1669,7 +1528,6 @@ local function applyLayout()
 	content.Position = UDim2.fromOffset(sideW + SIDEBAR_GAP, 0)
 	content.Size = UDim2.new(1, -(sideW + SIDEBAR_GAP), 1, 0)
 
-	-- if the new size pushed the window off screen, put it back in the middle
 	task.delay(0.1, function()
 		if not main.Parent then return end
 		local pos, size = main.AbsolutePosition, main.AbsoluteSize
@@ -1709,7 +1567,6 @@ local function selectTab(name)
 	end
 end
 
--- Adds a nav button + a page. Returns its two columns ({ left, right }) to put cards in.
 local function addTab(order, name)
 	local button = create("TextButton", {
 		LayoutOrder = order,
@@ -1750,11 +1607,9 @@ local function addTab(order, name)
 
 	tabs[name] = { button = button, label = label, bar = bar, page = page }
 	button.MouseButton1Click:Connect(function() selectTab(name) end)
-	-- the page is a 2-column grid: build cards in .left and .right (they stack on narrow windows)
 	return makeColumns(page, 1)
 end
 
--- Collapsible card shown on a tab page: icon tile + title + chevron, then the body. Returns the body frame.
 local function makeCard(parent, buildIcon, title, order)
 	local card = create("Frame", {
 		LayoutOrder = order or 1,
@@ -1806,7 +1661,6 @@ local function makeCard(parent, buildIcon, title, order)
 		Parent = card,
 	}, { vlist(8) })
 
-	-- collapse / expand
 	header.MouseButton1Click:Connect(function()
 		closeDropdowns()
 		body.Visible = not body.Visible
@@ -1816,7 +1670,6 @@ local function makeCard(parent, buildIcon, title, order)
 	return body
 end
 
--- Text line that wraps and grows downward
 local function makeLine(parent, order, size, color, font)
 	return create("TextLabel", {
 		LayoutOrder = order,
@@ -1834,7 +1687,6 @@ local function makeLine(parent, order, size, color, font)
 	})
 end
 
--- Switch row (label on the left, pill switch on the right)
 local function makeToggle(parent, order, labelText, featureName)
 	local row = create("TextButton", {
 		LayoutOrder = order,
@@ -1888,42 +1740,9 @@ local function makeToggle(parent, order, labelText, featureName)
 	end)
 end
 
--- Label on top, full-width select field below, popup list overlays everything
--- ---------------------------------------------------------------------------
--- Reusable dropdown: the standard dropdown for every feature (Auto Tower, Auto Buy, ...).
---
---   local dd = makeDropdown(parent, order, {
---       label       = "Mode",          -- text above the trigger (nil = no label)
---       placeholder = "None",          -- trigger text while nothing is selected
---       emptyText   = "No options",    -- panel text when there are no options
---       multi       = false,           -- true = several options can be selected; the panel stays
---                                      --        open and has Select All / Clear buttons
---       searchable  = false,           -- adds a search box to the panel
---       maxHeight   = 130,             -- tallest the option list gets (it scrolls beyond that)
---       onSelect    = function(key, isSelected) end, -- single: picked option; multi: toggled one
---       onChange    = function(selectedSet) end,     -- after every change of the selection
---   })
---
--- Options are strings, or { key = "id", label = "Shown text" }. Only the label is displayed.
---
--- Look: every option is plain text. The selected option(s) use the accent font colour, all others
--- the default one. No checkbox, no highlight. The trigger shows the selected name; in multi mode
--- it shows every selected name, comma separated (cut with "..." when too long), or the
--- placeholder when nothing is selected.
---
--- Returned object: SetOptions, SetValue, SetSelected, GetSelected, SetDimmed, SetLabel,
--- SetPlaceholder, Open, Close, Reposition.
---
--- Placement (relative to the real screen, in an overlay above the whole UI, so no parent can clip
--- or cover it): the panel sits completely below the trigger when it fits there, otherwise
--- completely above it, otherwise on the roomier side with the option list shrunk (it scrolls on
--- its own). A fixed gap separates panel and trigger, so the two never overlap. While open the
--- position is recalculated every time the trigger moves or the screen changes (scroll, window
--- drag / resize, layout changes, filtering); it closes when the trigger is scrolled out of view.
--- ---------------------------------------------------------------------------
 local DROPDOWN_ITEM_H = 26
-local DROPDOWN_GAP = 4         -- space between trigger and panel
-local DROPDOWN_MARGIN = 8      -- keep this far from the screen edges
+local DROPDOWN_GAP = 4         
+local DROPDOWN_MARGIN = 8      
 
 local function makeDropdown(parent, order, config)
 	config = config or {}
@@ -1975,8 +1794,6 @@ local function makeDropdown(parent, order, config)
 	})
 	makeChevron(btn, UDim2.new(1, -14, 0.5, 0), THEME.body)
 
-	-- the panel is a child of the ScreenGui (not of any card), so card layouts / scroll frames can
-	-- never clip it and it is always drawn above the rest of the UI
 	local panel = create("Frame", {
 		BackgroundColor3 = THEME.popup,
 		BorderSizePixel = 0,
@@ -2061,11 +1878,9 @@ local function makeDropdown(parent, order, config)
 	local visibleCount = 0
 	local watchConn = nil
 
-	-- ----------------------------------------------------------------- display
 	local function updateTrigger()
 		local text
 		if multi then
-			-- every selected name, in option order, comma separated (the label truncates with "...")
 			local names = {}
 			for _, option in ipairs(dd.options) do
 				if dd.selected[option.key] then table.insert(names, option.label) end
@@ -2078,7 +1893,6 @@ local function makeDropdown(parent, order, config)
 		if valueLabel.Text ~= text then valueLabel.Text = text end
 	end
 
-	-- selected = accent font colour, everything else = default font colour
 	local function paintItem(item)
 		local key = item.option.key
 		local on = (multi and dd.selected[key] == true) or (not multi and key == dd.value)
@@ -2090,8 +1904,6 @@ local function makeDropdown(parent, order, config)
 		updateTrigger()
 	end
 
-	-- ----------------------------------------------------------------- placement
-	-- All maths is in absolute screen space; `origin` converts to the overlay's local space.
 	function dd.Reposition()
 		if dd.isOpen ~= true or not panel.Parent then return end
 		local origin, viewport = gui.AbsolutePosition, gui.AbsoluteSize
@@ -2103,13 +1915,11 @@ local function makeDropdown(parent, order, config)
 		local width = math.max(math.min(trigSize.X, screenRight - screenLeft), 0)
 		local wanted = headerH + math.min(math.max(visibleCount, 1) * DROPDOWN_ITEM_H, maxListH)
 
-		-- the free space on each side of the trigger, after the fixed gap
 		local belowTop = trigPos.Y + trigSize.Y + DROPDOWN_GAP
 		local aboveBottom = trigPos.Y - DROPDOWN_GAP
 		local spaceBelow = math.max(screenBottom - belowTop, 0)
 		local spaceAbove = math.max(aboveBottom - screenTop, 0)
 
-		-- below if it fits, else above if it fits, else the roomier side (the list then scrolls)
 		local placeBelow
 		if spaceBelow >= wanted then
 			placeBelow = true
@@ -2120,8 +1930,6 @@ local function makeDropdown(parent, order, config)
 		end
 
 		local height = math.min(wanted, placeBelow and spaceBelow or spaceAbove)
-		-- below: starts under the trigger. above: ends over the trigger. Either way the panel
-		-- lies completely outside the trigger rectangle.
 		local top = placeBelow and belowTop or (aboveBottom - height)
 		local x = math.clamp(trigPos.X, screenLeft, math.max(screenLeft, screenRight - width))
 
@@ -2130,7 +1938,6 @@ local function makeDropdown(parent, order, config)
 		dd.placement = placeBelow and "below" or "above"
 	end
 
-	-- false when the trigger is hidden, or scrolled completely out of a scrolling / clipping parent
 	local function triggerVisible()
 		local pos, size = btn.AbsolutePosition, btn.AbsoluteSize
 		local node = btn
@@ -2164,7 +1971,6 @@ local function makeDropdown(parent, order, config)
 	end
 	if searchBox then searchBox:GetPropertyChangedSignal("Text"):Connect(applyFilter) end
 
-	-- ----------------------------------------------------------------- open / close
 	function dd.Close()
 		dd.isOpen = false
 		panel.Visible = false
@@ -2184,8 +1990,6 @@ local function makeDropdown(parent, order, config)
 		catcher.Visible = true
 		dd.Reposition()
 
-		-- recalculate whenever the trigger moves or the screen changes: page scroll, window drag
-		-- or resize, layout changes, filtering
 		local last = { 0, 0, 0, 0, 0, 0, 0, 0, -1 }
 		watchConn = game:GetService("RunService").Heartbeat:Connect(function()
 			if not panel.Parent or not btn.Parent then
@@ -2215,7 +2019,6 @@ local function makeDropdown(parent, order, config)
 		end
 	end)
 
-	-- ----------------------------------------------------------------- selection
 	local function notifyChange()
 		if config.onChange then config.onChange(dd.selected) end
 	end
@@ -2258,7 +2061,6 @@ local function makeDropdown(parent, order, config)
 		end)
 	end
 
-	-- ----------------------------------------------------------------- public API
 	local function normalize(option)
 		if type(option) == "table" then
 			local label = tostring(option.label or option.key)
@@ -2294,7 +2096,6 @@ local function makeDropdown(parent, order, config)
 			table.insert(dd.itemList, { option = option, button = button })
 		end
 
-		-- keep only selections that still exist
 		for key in pairs(dd.selected) do
 			if not dd.byKey[key] then dd.selected[key] = nil end
 		end
@@ -2302,14 +2103,12 @@ local function makeDropdown(parent, order, config)
 		paintAll()
 	end
 
-	-- single mode: select by key
 	function dd.SetValue(value)
 		if dd.value == value then return end
 		dd.value = value
 		paintAll()
 	end
 
-	-- multi mode: an array of keys or a { [key] = true } set (replaces the selection in place)
 	function dd.SetSelected(keys)
 		for key in pairs(dd.selected) do dd.selected[key] = nil end
 		for k, v in pairs(keys or {}) do
@@ -2342,9 +2141,6 @@ local function makeDropdown(parent, order, config)
 	return dd
 end
 
-----------------------------------------------------------------------
--- Tab: Auto Roll
-----------------------------------------------------------------------
 local rollBody = makeCard(addTab(1, "Roll").left, function(tile)
 	create("TextLabel", {
 		Size = UDim2.fromScale(1, 1),
@@ -2394,9 +2190,6 @@ task.spawn(function()
 	end
 end)
 
-----------------------------------------------------------------------
--- Auto Potion
-----------------------------------------------------------------------
 local POTION_CATEGORIES = {
 	Luck = { buffKey = "Luck" },
 	Income = { buffKey = "Money Multiplier" },
@@ -2608,12 +2401,8 @@ task.spawn(function()
 	end
 end)
 makeToggle(potionBody, 4, "Auto Use", "AutoPotion")
-----------------------------------------------------------------------
--- Tab: Auto Tower
-----------------------------------------------------------------------
 local towerTab = addTab(3, "Auto Tower")
 local towerBody = makeCard(towerTab.left, function(tile)
-	-- crossed swords, drawn with two rotated bars so no font/emoji is needed
 	for _, rot in ipairs({ 45, -45 }) do
 		create("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
@@ -2657,11 +2446,7 @@ local towerLine = makeLine(towerInfo, 1, 12, THEME.body, Enum.Font.GothamMedium)
 local statsLine = makeLine(towerInfo, 2, 10, THEME.subtext)
 statsLine.TextWrapped = false
 statsLine.TextTruncate = Enum.TextTruncate.AtEnd
-----------------------------------------------------------------------
--- Tab: Miscellaneous
-----------------------------------------------------------------------
 local miscBody = makeCard(addTab(5, "Miscellaneous").left, function(tile)
-	-- settings icon: three stacked bars
 	for i, w in ipairs({ 14, 9, 12 }) do
 		create("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
@@ -2677,13 +2462,7 @@ end, "Miscellaneous")
 makeToggle(miscBody, 1, "Anti AFK", "AntiAfk")
 makeToggle(miscBody, 2, "Auto Reconnect", "AutoReconnect")
 
-----------------------------------------------------------------------
--- Tab: Event -> Quest card (local player's Autumn quests, Daily + Hourly)
--- Data comes from DataController[period.dataKey]() and AutumnQuestConfig, the same way the
--- reference script reads them; the card re-renders whenever that data changes.
-----------------------------------------------------------------------
 local function questIcon(tile)
-	-- "!" icon
 	create("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		Position = UDim2.new(0.5, 0, 0.5, -3),
@@ -2742,7 +2521,6 @@ local function loadQuestModules()
 	return true
 end
 
--- Snapshot of every quest period, with progress clamped to 0..target
 local function readQuestSections()
 	if not Quests.loaded then
 		return { { title = "Quests", quests = {}, message = "Waiting for the game's quest data..." } }
@@ -2813,7 +2591,6 @@ local function buildQuestRow(parent, order, q)
 		Parent = parent,
 	}, { corner(6), pad(8, 6, 8, 6), vlist(4) })
 
-	-- status column: progress while in progress, CLAIMED once claimed
 	local statusText = info.text
 	if q.status == "progress" then
 		statusText = formatNumber(q.progress) .. "/" .. formatNumber(q.target)
@@ -2866,7 +2643,6 @@ local function buildQuestRow(parent, order, q)
 	}, { pill() })
 end
 
--- Rebuilds the card only when the data actually changed
 local function renderQuests()
 	local sections = readQuestSections()
 	local signature = questSignature(sections)
@@ -2902,7 +2678,7 @@ end
 local function scheduleQuestRender()
 	Quests.dirty = true
 end
--- Re-render on any Daily/Hourly change: progress, claims, newly rolled quests
+
 local function hookQuestChanges()
 	if not Quests.loaded then return end
 	for _, period in Quests.Config.Periods do
@@ -3126,17 +2902,7 @@ task.spawn(function()
 		end
 	end
 end)
-----------------------------------------------------------------------
--- AUTO BUY (Event tab -> Apple Shop card)
--- Buys the selected Apple Shop items through AppleShopService.Buy.
---
--- Execution priority: Auto Buy > Auto Quest > Auto Claim Quest > Auto Roll.
--- When a pass starts it raises AutumnTravel.buyRequested. Every other feature checks that flag
--- in all of its movement loops, so each of them aborts its current move, releases the movement
--- lock and waits. Auto Buy then takes the lock (so two features never move at once), teleports
--- to the shop zone, buys, releases the lock and lowers the flag. Roll / Quest / Claim then
--- resume on their own (Auto Roll pivots back to the Leaf Dice, Auto Quest restarts its activity).
-----------------------------------------------------------------------
+
 AutoBuy.token = 0
 AutoBuy.workerActive = false
 AutoBuy.loaded = false
@@ -3145,12 +2911,12 @@ AutoBuy.stockKey = nil
 AutoBuy.DataController = nil
 AutoBuy.dataHooks = {}
 AutoBuy.hooked = {}
-AutoBuy.offers = {}     -- Apple Shop offers in config order
-AutoBuy.rows = {}       -- [offerId] = { offer, frame, check, fill }
-AutoBuy.selected = {}   -- [offerId] = true
+AutoBuy.offers = {}
+AutoBuy.rows = {}       
+AutoBuy.selected = {}   
 AutoBuy.status = "Off"
-AutoBuy.passDelay = 2   -- seconds between passes while purchases succeed (others may move)
-AutoBuy.idleDelay = 10  -- seconds between passes when nothing could be bought
+AutoBuy.passDelay = 2  
+AutoBuy.idleDelay = 10  
 
 function AutoBuy.alive(token)
 	return AutoBuy.token == token and State.Features.AutoBuy
@@ -3171,7 +2937,6 @@ function AutoBuy.selectedCount()
 	return n
 end
 
--- ---------------------------------------------------------------- modules
 function AutoBuy.loadModules()
 	if AutoBuy.loaded then return true end
 	local ok, err = pcall(function()
@@ -3191,7 +2956,6 @@ function AutoBuy.loadModules()
 	return true
 end
 
--- ---------------------------------------------------------------- status / list UI
 function AutoBuy.setStatus(text)
 	AutoBuy.status = text
 	AutoBuy.refresh()
@@ -3343,9 +3107,7 @@ function AutoBuy.build()
 	AutoBuy.queueRefreshOptions()
 	AutoBuy.refresh()
 end
--- ---------------------------------------------------------------- the purchase pass
--- One pass: take absolute movement priority, go to the shop, buy every selected item, give the
--- movement back. Returns true when at least one purchase was reported successful.
+
 function AutoBuy.runPass(token)
     local offers = {}
     local selectedCount, soldOutCount = 0, 0
@@ -3390,7 +3152,6 @@ function AutoBuy.runPass(token)
                 bought = true
                 boughtCount = math.max(boughtCount + 1, getBought(offer))
 
-                -- Recheck the item limit before waiting or requesting another purchase.
                 if not AutoBuy.selected[offer.id] or not keepGoing() or isSoldOut(offer, boughtCount) then break end
                 task.wait((AutoBuy.Config.REQUEST_DEBOUNCE or 0.5) + 0.1)
             end
@@ -3427,7 +3188,6 @@ function AutoBuy.worker(token)
 			end
 			if AutoBuy.alive(token) then
 				AutoBuy.setStatus(bought and "Waiting for the next pass" or allSoldOut and "Selected items at their purchase limits" or "Nothing bought, waiting")
-				-- during this pause the other features are free to move
 				AutoBuy.sleep(token, bought and AutoBuy.passDelay or AutoBuy.idleDelay)
 			end
 		end
@@ -3445,10 +3205,8 @@ AutoBuy.setEnabled = function(enabled)
 	end
 end
 
--- ---------------------------------------------------------------- card (Event tab, left column)
 do
 	local function shopIcon(tile)
-		-- bag: a body with a handle on top
 		create("Frame", {
 			AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.new(0.5, 0, 0.5, 3),
@@ -3472,7 +3230,6 @@ do
 	AutoBuy.statusLine = makeLine(body, 2, 11, THEME.subtext)
 	AutoBuy.statusLine.Text = "Off"
 
-	-- item selection uses the shared dropdown component (multi-select checklist with search)
 	AutoBuy.dropdown = makeDropdown(body, 3, {
 		label = "Items",
 		multi = true,
@@ -3482,12 +3239,11 @@ do
 		maxHeight = 180,
 		onChange = function() AutoBuy.refresh() end,
 	})
-	AutoBuy.selected = AutoBuy.dropdown.selected -- one shared set: the pass buys what is ticked
+	AutoBuy.selected = AutoBuy.dropdown.selected 
 end
 
 table.insert(refreshers, AutoBuy.refresh)
 
--- build the item list as soon as the shop config can be required (retries until it works)
 task.spawn(function()
 	while gui.Parent and not AutoBuy.built do
 		pcall(AutoBuy.build)
@@ -3495,7 +3251,6 @@ task.spawn(function()
 	end
 end)
 
--- Poll for changed stock/restocks without rebuilding unchanged dropdown options.
 task.spawn(function()
 	while gui.Parent do
 		if AutoBuy.built then
@@ -3505,7 +3260,6 @@ task.spawn(function()
 		task.wait(math.max(1, interval))
 	end
 end)
--- Render once data loads, then refresh on changes with a slow safety-net pass.
 task.spawn(function()
 	local nextLoadTry, nextHookTry, lastRender = 0, 0, 0
 	while gui.Parent do
@@ -3530,9 +3284,6 @@ end)
 refreshColumns()
 selectTab("Roll")
 
-----------------------------------------------------------------------
--- Footer: hotkey
-----------------------------------------------------------------------
 local hotkeyRow = create("Frame", {
 	Position = UDim2.new(0, 0, 1, -22),
 	Size = UDim2.new(1, 0, 0, 22),
@@ -3592,29 +3343,27 @@ table.insert(connections, UserInputService.InputBegan:Connect(function(input, ga
 	end
 end))
 
--- Dragging
 do
-	local drag = {}
+	local dragging, dragStart, startPos
 	table.insert(connections, titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			closeDropdowns()
-			drag.dragging, drag.dragStart, drag.startPos = true, input.Position, main.Position
+			dragging, dragStart, startPos = true, input.Position, main.Position
 		end
 	end))
 	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
-		if drag.dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			local delta = input.Position - drag.dragStart
-			main.Position = UDim2.new(drag.startPos.X.Scale, drag.startPos.X.Offset + delta.X, drag.startPos.Y.Scale, drag.startPos.Y.Offset + delta.Y)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
 		end
 	end))
 	table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			drag.dragging = false
+			dragging = false
 		end
 	end))
 end
 
--- Keep the dropdown in sync with the configured tower catalog
 local lastSignature = nil
 local function refreshTowerOptions()
 	if not loadTowerModules() then return end
@@ -3671,12 +3420,10 @@ local function refreshTowerOptions()
 	Tower.wake = true
 	notify()
 end
--- GUI <- State sync
+
 local function refreshGui()
 	for _, fn in ipairs(refreshers) do fn() end
 
-	-- Auto Roll
-	-- State.Rolls counts dice returned by successful Roll calls.
 	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls))
 	leafBalance.Text = ("Leaf Balance: %s"):format(formatNumber(leafBalanceValue))
 	local pooledResults = {}
@@ -3686,7 +3433,6 @@ local function refreshGui()
 	table.sort(pooledResults)
 	rollResultsLine.Text = "Results: " .. (#pooledResults > 0 and table.concat(pooledResults, ", ") or "None yet")
 
-	-- Auto Tower
 	local S = State.TowerStats
 	local floorText = S.Floor and (" floor " .. S.Floor) or ""
 	towerLine.Text = Tower.activeName and ("Tower: " .. (Tower.displayByName[Tower.activeName] or Tower.activeName) .. floorText) or "Tower: -"
@@ -3694,14 +3440,13 @@ local function refreshGui()
 
 	modeDropdown.SetValue(State.TowerMode)
 	towerDropdown.SetValue(Tower.displayByName[State.SelectedTower] or State.SelectedTower)
-	towerDropdown.SetDimmed(State.TowerMode ~= "Single") -- the Tower pick only applies in Single mode
+	towerDropdown.SetDimmed(State.TowerMode ~= "Single")
 
 	refreshHotkey()
 end
 onChange(refreshGui)
 refreshGui()
 
--- Safety net: periodically re-sync the GUI and the tower list
 local syncAlive = true
 task.spawn(function()
 	while syncAlive and gui.Parent do
@@ -3712,22 +3457,6 @@ task.spawn(function()
 end)
 
 local function initializeAutoQuest()
--- AutoQuest: automatically works on every Autumn quest.
---
--- 1) Apple quests (apples / rare Apples / combo / Rush): uses Shared Travel to
---    reach the Orchard and sweep apple positions. The game's checkReach collects
---    each apple within reach. Apple Rushes get top priority since they only last 90 seconds.
--- 2) Apple Board quests: uses Shared Travel to reach the board area and buy
---    upgrade levels (spends Apples) until the quest completes.
--- 3) Leaf Dice quests: uses Shared Travel to reach the Leaf Dice stone and roll
---    (spends Leaves) until the quest completes.
--- 4) Tower quests (floors / 99-floor run): simulates full Turkey Tower runs
---    using the player's actual tower team (health carries over between floors
---    and team members rotate in, exactly like TowerClass.completeFloor) to
---    pick the best tower, then auto-starts it and grinds floors until the
---    quests complete.
---
--- Click the status label at the top of the screen to toggle Auto Quest.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -3746,31 +3475,22 @@ local Network = require(ReplicatedStorage.Packages.Network)
 
 local player = Players.LocalPlayer
 
--- Client entry points for Apple Board purchases and Leaf Dice rolls.
 local buyBoardUpgrade = (Network.ClientComm.new(ReplicatedStorage.Network, false, "AppleService")):GetFunction("BuyUpgrade")
 local rollLeafDice = (Network.ClientComm.new(ReplicatedStorage.Network, false, "LeafDiceService")):GetFunction("Roll")
 
--- --------------------------------------------------------------------------
--- Configuration
--- --------------------------------------------------------------------------
-
 local CONFIG = {
-	AUTO_APPLES = true,        -- collect apples for apple / rare / combo / rush quests
-	AUTO_BOARD_LEVELS = true,  -- buy Apple Board levels (spends Apples)
-	AUTO_LEAF_ROLLS = true,    -- roll the Leaf Dice (spends Leaves)
-	AUTO_TOWER_RUN = true,     -- auto-run towers for floor quests
-	TOWER_PREFERENCE = "Hardest", -- "First" = easiest clearable tower, "Hardest" = best rewards
-	TOWER_START_COOLDOWN = 6,   -- seconds between start attempts (server debounce is 5)
+	AUTO_APPLES = true,
+	AUTO_BOARD_LEVELS = true,
+	AUTO_LEAF_ROLLS = true,    
+	AUTO_TOWER_RUN = true,     
+	TOWER_PREFERENCE = "Hardest", 
+	TOWER_START_COOLDOWN = 6,   
 	ArriveDistance = 8,
-	BOARD_BUY_COOLDOWN = 10,   -- seconds to wait when a purchase pass buys nothing
-	DICE_RETRY_COOLDOWN = 10,  -- seconds to wait when a roll fails
-
-	RUN_FLOOR_CHECK = 100, -- simulate a full 100-floor run (leaves margin over 99)
+	BOARD_BUY_COOLDOWN = 10,  
+	DICE_RETRY_COOLDOWN = 10, 
+	RUN_FLOOR_CHECK = 100, 
 }
 
--- Quest objectives handled by each activity. Quest ids, targets, and the
--- current roll all come from AutumnQuestConfig and the player's quest data,
--- so nothing here needs to be kept in sync by hand.
 local OBJECTIVES = {
 	APPLES = { apples = true, rareApples = true, combo = true },
 	RUSH = { rushApples = true },
@@ -3780,8 +3500,6 @@ local OBJECTIVES = {
 	RUN_FLOOR = { runFloor = true },
 }
 
--- --------------------------------------------------------------------------
--- Use the host Quest card and feature toggle.
 local enabled = State.Features.AutoQuest
 local mainStatus, towerStatus = "Idle", nil
 local function refreshStatus()
@@ -3796,14 +3514,6 @@ local function setTowerStatus(status)
 	refreshStatus()
 end
 
--- Quest state helpers
--- --------------------------------------------------------------------------
-
--- Reads the quests currently rolled for the player from the Autumn daily /
--- hourly quest data (ids from state.quests, targets from AutumnQuestConfig).
--- Freshly rolled quests have no progress entry yet (the server starts
--- progress empty), so missing progress counts as 0. Claimed quests are
--- skipped. Returns items of { objective, target, progress }.
 local function getRolledQuests()
 	local rolled = {}
 
@@ -3837,8 +3547,6 @@ local function getRolledQuests()
 	return rolled
 end
 
--- Returns the smallest remaining count across incomplete rolled quests whose
--- objective is in the set, or nil when there is nothing left to do.
 local function getRemaining(objectives)
 	local best = nil
 
@@ -3858,17 +3566,11 @@ local function getRushRemaining()
 	return getRemaining(OBJECTIVES.RUSH)
 end
 
--- --------------------------------------------------------------------------
--- Apple Rush detection
--- --------------------------------------------------------------------------
-
 local function isRushActive()
 	local endsAt = workspace:GetAttribute(AppleConfig.Rush.ATTRIBUTE)
 	return type(endsAt) == "number" and workspace:GetServerTimeNow() < endsAt
 end
 
--- --------------------------------------------------------------------------
--- Character state used by Auto Quest activities.
 local function getCharacterParts()
     local character = player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -3905,10 +3607,7 @@ local function moveTowards(position, timeout, shouldStop)
     end
     return false
 end
--- Apple Rush auto-collect
--- --------------------------------------------------------------------------
 
--- Nearest visible apple position (apple visuals live in workspace.AutumnApples).
 local function getNearestApplePosition(fromPosition)
 	local folder = workspace:FindFirstChild("AutumnApples")
 	if not folder then
@@ -3937,8 +3636,6 @@ local function getNearestApplePosition(fromPosition)
 	return bestPosition
 end
 
--- Keeps collecting while a rush is running with rush quests left, or while
--- any regular apple quest (apples / rare / combo) is incomplete.
 local function shouldStopApples()
 	if not enabled or AutumnTravel.buyRequested then
 		return true
@@ -3955,9 +3652,6 @@ local function shouldStopApples()
 	return true
 end
 
--- Sweeps the Orchard chasing the nearest apple; the game's checkReach
--- collects apples automatically as they enter reach. Always yields at
--- least once per iteration so the loop can never starve the frame.
 local function chaseApples()
     while not shouldStopApples() do
         local _, root = getCharacterParts()
@@ -3974,22 +3668,13 @@ local function chaseApples()
         end
     end
 end
--- --------------------------------------------------------------------------
--- Activity: collect apples (rush + apple / rare / combo quests)
--- --------------------------------------------------------------------------
 
 local function collectApplesActivity()
-	-- Sweep the Orchard through Shared Travel until every apple quest completes.
 	if not shouldStopApples() then
 		chaseApples()
 	end
 end
 
--- --------------------------------------------------------------------------
--- Activity: buy Apple Board levels (spends Apples)
--- --------------------------------------------------------------------------
-
--- waits, but returns early when Auto Buy needs the character (so the lock is freed at once)
 local function interruptibleWait(seconds)
 	local t0 = os.clock()
 	while os.clock() - t0 < seconds and enabled and not AutumnTravel.buyRequested do
@@ -4000,9 +3685,6 @@ end
 local function buyBoardLevelsActivity()
 	while enabled and not AutumnTravel.questRequested and not AutumnTravel.buyRequested and CONFIG.AUTO_BOARD_LEVELS and getRemaining(OBJECTIVES.BOARD) do
 		local boughtAny = false
-
-		-- Try every upgrade; the server validates unlocks, caps, and cost.
-		-- Passing true buys as many levels as the player can afford at once.
 		for _, upgrade in AppleConfig.Upgrades do
 			if not getRemaining(OBJECTIVES.BOARD) then
 				break
@@ -4020,16 +3702,11 @@ local function buyBoardLevelsActivity()
 			setStatus("Board: buying levels")
 			task.wait(0.2)
 		else
-			-- Out of Apples (or everything maxed): wait and retry later.
 			setStatus("Board: waiting for Apples")
 			interruptibleWait(CONFIG.BOARD_BUY_COOLDOWN)
 		end
 	end
 end
-
--- --------------------------------------------------------------------------
--- Activity: roll the Leaf Dice (spends Leaves)
--- --------------------------------------------------------------------------
 
 local function rollLeafDiceActivity()
 	local shouldContinue = function()
@@ -4056,15 +3733,12 @@ local function rollLeafDiceActivity()
 	end
 
 	while enabled and not AutumnTravel.questRequested and not AutumnTravel.buyRequested and CONFIG.AUTO_LEAF_ROLLS and getRemaining(OBJECTIVES.LEAF_ROLLS) do
-		-- Recheck immediately before each event; never roll outside the validated box.
 		if not ensureLeafDicePosition() then
 			if not shouldContinue() then break end
 			task.wait(1)
 			continue
 		end
 
-		-- Multi rolls count as MULTI rolls toward the quest; fall back to a
-		-- single roll when storage or Leaves only allow one at a time.
 		local ok, results = pcall(rollLeafDice, LeafDice.MULTI)
 		local rolled = ok and type(results) == "table" and #results > 0
 
@@ -4077,14 +3751,12 @@ local function rollLeafDiceActivity()
 			setStatus("Dice: rolling")
 			interruptibleWait(LeafDice.ROLL_DURATION + 0.1)
 		else
-			-- Out of Leaves or unit storage: wait and retry later.
 			setStatus("Dice: waiting for Leaves")
 			interruptibleWait(CONFIG.DICE_RETRY_COOLDOWN)
 		end
 	end
 end
 
--- --------------------------------------------------------------------------
 local function withAutoQuestPriority(activity)
     if not enabled or AutumnTravel.buyRequested then return false end
 
@@ -4152,11 +3824,7 @@ local function runQuestActivity(activity, zoneName, alwaysMove)
         if not ok then warn("[AutumnDice] Auto Quest activity failed: " .. tostring(err)) end
     end)
 end
--- Master scheduler
--- --------------------------------------------------------------------------
 
--- Picks the next activity by priority: Apple Rushes are time limited, the
--- board and dice quests finish quickly, and apple picking is the long grind.
 task.spawn(function()
 	while true do
 		task.wait(1)
@@ -4182,10 +3850,6 @@ task.spawn(function()
 	end
 end)
 
--- --------------------------------------------------------------------------
--- Tower team and full-run simulation (mirrors TowerClass)
--- --------------------------------------------------------------------------
-
 local function getBuff(name)
 	local ok, value = pcall(function()
 		return BuffController.GetBuff(name)
@@ -4196,8 +3860,6 @@ local function getBuff(name)
 	return 1
 end
 
--- Builds the player's tower team with effective (buffed) stats, mirroring
--- TowerClass.new. Returns an array of { name, damage, health }.
 local function getTeam()
 	local team = {}
 
@@ -4243,13 +3905,7 @@ local function getMilestones()
 	return nil
 end
 
--- Simulates one full tower run using the game's combat rules:
---   * the active unit strikes first; the enemy retaliates while alive
---   * unit health carries over between floors (no healing between floors)
---   * when a unit dies the next team member takes over mid-fight
--- Returns the number of floors cleared in a single run.
 local function simulateRun(section, maxFloors, team)
-	-- Copy the team so repeated simulations don't mutate the original stats.
 	local members = {}
 	for _, member in team do
 		table.insert(members, { damage = member.damage, health = member.health })
@@ -4273,30 +3929,24 @@ local function simulateRun(section, maxFloors, team)
 			local member = members[currentMember]
 
 			if member.damage <= 0 then
-				-- This member can never kill the enemy; it dies contributing nothing.
 				currentMember += 1
 				continue
 			end
 
 			if enemyDamage <= 0 then
-				-- Enemy cannot fight back: the member clears the floor untouched.
 				floorCleared = true
 				break
 			end
 
-			-- Attacks the member makes before dying (it always strikes first).
 			local attacksBeforeDying = math.ceil(member.health / enemyDamage)
-			-- Attacks needed to bring the enemy down.
 			local attacksNeeded = math.ceil(enemyHealth / member.damage)
 
 			if attacksNeeded <= attacksBeforeDying then
-				-- Member survives the floor; only hit on turns the enemy lived.
 				member.health -= (attacksNeeded - 1) * enemyDamage
 				floorCleared = true
 				break
 			end
 
-			-- Member dies on this floor after dealing its attacks' worth of damage.
 			enemyHealth -= attacksBeforeDying * member.damage
 			currentMember += 1
 		end
@@ -4309,12 +3959,6 @@ local function simulateRun(section, maxFloors, team)
 	return maxFloors
 end
 
--- Finds the best tower section to run.
--- When requireFullRun is true, only a section that can clear the full
--- run-floor quest target counts (used for the 99-floor quest). Otherwise the
--- section with the deepest simulated clear is returned so the cumulative
--- floor quests can be grinded. Returns the section, or nil + info string.
--- Target of the single-run floor quest (e.g. "clear 99 floors in one run").
 local function getRunFloorTarget()
 	for _, period in AutumnQuestConfig.Periods do
 		for _, quest in period.quests do
@@ -4376,10 +4020,6 @@ local function findBestSection(requireFullRun)
 	return nil, "no towers unlocked"
 end
 
--- --------------------------------------------------------------------------
--- Tower auto-run
--- --------------------------------------------------------------------------
-
 local lastTowerAttempt = 0
 
 local function isTowerRunActive()
@@ -4402,7 +4042,6 @@ local function tryStartTower(section)
 	return ok and result == true
 end
 
--- Watches the floor quests and auto-runs towers until they complete.
 task.spawn(function()
 	while true do
 		task.wait(1)
@@ -4422,9 +4061,6 @@ task.spawn(function()
 			setTowerStatus("Tower: run in progress")
 			continue
 		end
-
-		-- Prefer a tower that can clear the 99-floor quest in one run;
-		-- otherwise grind the deepest tower for the cumulative floor quests.
 		local section, reason = nil, nil
 
 		if runFloorRemaining then
@@ -4454,9 +4090,6 @@ end
 
 end
 
-----------------------------------------------------------------------
--- Unload / public API
-----------------------------------------------------------------------
 local function Unload()
 	syncAlive = false
 	setAntiAfk(false)
@@ -4499,10 +4132,6 @@ env.AutumnDice = {
 	Travel = AutumnTravel,
 }
 
-----------------------------------------------------------------------
--- Defaults: Anti AFK and Auto Roll start ON. SetFeature starts the real
--- behavior, and the toggles follow State.
-----------------------------------------------------------------------
 for _, name in ipairs({ "AntiAfk", "AutoDice" }) do
 	SetFeature(name, true)
 end
