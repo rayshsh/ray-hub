@@ -100,6 +100,7 @@ local State = {
 	Detail = "Enable \"Auto Roll Autumn Dice\" to start.",
 	Hotkey = CONFIG.DefaultHotkey,
 	Rolls = 0,
+	RollResultPool = {},
 
 	TowerMode = "Best Leaf Tower",
 	SelectedTower = nil,
@@ -495,6 +496,20 @@ local function isAtLeafDice()
 	return AutumnTravel.isNearZone("LeafDice", 10)
 end
 
+local function poolRollResults(results)
+	for _, entry in ipairs(results) do
+		if type(entry) == "table" and entry.result ~= nil then
+			local unitId = tostring(entry.result)
+			local counts = State.RollResultPool[unitId]
+			if not counts then
+				counts = { total = 0, autoSold = 0 }
+				State.RollResultPool[unitId] = counts
+			end
+			counts.total += 1
+			if entry.autoSold then counts.autoSold += 1 end
+		end
+	end
+end
 local function rollLoop(id, rollRemote)
 	local consecutiveErrors = 0
 	State.Rolls = 0
@@ -532,11 +547,17 @@ local function rollLoop(id, rollRemote)
 					if not called then ok, result = false, ok end
 					if not alive(id) then return end
 
-					if ok and result ~= false then
+					if ok and type(result) == "table" then
+						local rolledCount = math.max(#result, 1)
 						consecutiveErrors = 0
-						State.Rolls += 1
+						poolRollResults(result)
+						State.Rolls += rolledCount
 						SetStatus("AutoRollEnabled", ("The custom rolling loop is active. Rolls completed: %d"):format(State.Rolls))
 						if not sleep(id, CONFIG.RollDelay) then return end
+					elseif ok then
+						local reason = result == nil and "rejected by server" or ("rejected by server: " .. tostring(result))
+						SetStatus("Error", reason .. " (not counted toward MaxRollErrors)")
+						if not sleep(id, CONFIG.RollErrorDelay) then return end
 					else
 						consecutiveErrors += 1
 						local msg = ("Roll failed (%d/%d): %s"):format(consecutiveErrors, CONFIG.MaxRollErrors, tostring(result))
@@ -2348,8 +2369,12 @@ local rollInfo = create("Frame", {
 	Parent = rollBody,
 }, { vlist(4) })
 
+local rollResultsLine = makeLine(rollInfo, 1, 11, THEME.subtext)
+rollResultsLine.Text = "Results: None yet"
 local rollCount = makeLine(rollInfo, 1, 12, THEME.subtext)
 local leafBalance = makeLine(rollInfo, 2, 12, THEME.subtext)
+local rollCount = makeLine(rollInfo, 2, 12, THEME.subtext)
+local leafBalance = makeLine(rollInfo, 3, 12, THEME.subtext)
 local leafBalanceValue = 0
 local leafBalanceHooked = false
 task.spawn(function()
@@ -3029,6 +3054,7 @@ AutoBuy.token = 0
 AutoBuy.workerActive = false
 AutoBuy.loaded = false
 AutoBuy.built = false
+AutoBuy.stockKey = nil
 AutoBuy.DataController = nil
 AutoBuy.dataHooks = {}
 AutoBuy.hooked = {}
@@ -3173,22 +3199,46 @@ local function uniqueOffers(offers)
     return unique
 end
 function AutoBuy.refreshOptions()
-    if not AutoBuy.built or not AutoBuy.dropdown then return end
-    AutoBuy.offers = uniqueOffers(AutoBuy.offers)
-    local options = {}
-    for _, offer in ipairs(AutoBuy.offers) do
-        table.insert(options, offerOption(offer))
-    end
-    AutoBuy.dropdown.SetOptions(options)
-end
+	if not AutoBuy.built or not AutoBuy.dropdown then return end
 
+	-- Re-read the shop config so newly stocked or restocked items are picked up.
+	local offers = AutoBuy.Config and AutoBuy.Config.Offers
+	if type(offers) == "table" then
+		AutoBuy.offers = uniqueOffers(offers)
+	else
+		AutoBuy.offers = uniqueOffers(AutoBuy.offers)
+	end
+
+	local options, signature = {}, {}
+	for _, offer in ipairs(AutoBuy.offers) do
+		table.insert(options, offerOption(offer))
+		table.insert(signature, offer.id .. ":" .. tostring(getBought(offer)))
+	end
+
+	local key = table.concat(signature, "|")
+	if key == AutoBuy.stockKey then return end
+	AutoBuy.stockKey = key
+	AutoBuy.dropdown.SetOptions(options)
+end
+local refreshQueued = false
+AutoBuy.refreshEvent = Instance.new("BindableEvent")
+table.insert(connections, AutoBuy.refreshEvent.Event:Connect(function()
+	refreshQueued = false
+	AutoBuy.refreshOptions()
+end))
+
+function AutoBuy.queueRefreshOptions()
+	if refreshQueued then return end
+	refreshQueued = true
+	AutoBuy.refreshEvent:Fire()
+end
 function AutoBuy.hookData()
     if not AutoBuy.DataController then return end
     local autumn = AutoBuy.DataController.Autumn
     for _, name in ipairs({ "ShopPurchases", "ShopDay" }) do
         if not AutoBuy.hooked[name] then
             local ok, conn = pcall(function()
-                return autumn[name].Changed(AutoBuy.refreshOptions)
+                return autumn[name].Changed(AutoBuy.queueRefreshOptions)
             end)
             if ok then
                 AutoBuy.hooked[name] = true
@@ -3199,17 +3249,16 @@ function AutoBuy.hookData()
 end
 
 function AutoBuy.build()
-    if AutoBuy.built or not AutoBuy.loadModules() then return end
-    local offers = AutoBuy.Config.Offers
-    if type(offers) ~= "table" then return end
+	if AutoBuy.built or not AutoBuy.loadModules() then return end
 
-    AutoBuy.offers = uniqueOffers(offers)
-    local options = {}
-    for _, offer in ipairs(AutoBuy.offers) do table.insert(options, offerOption(offer)) end
-    AutoBuy.dropdown.SetOptions(options)
-    AutoBuy.built = true
-    AutoBuy.hookData()
-    AutoBuy.refresh()
+	local offers = AutoBuy.Config.Offers
+	if type(offers) ~= "table" then return end
+
+	AutoBuy.offers = uniqueOffers(offers)
+	AutoBuy.built = true
+	AutoBuy.hookData()
+	AutoBuy.queueRefreshOptions()
+	AutoBuy.refresh()
 end
 -- ---------------------------------------------------------------- the purchase pass
 -- One pass: take absolute movement priority, go to the shop, buy every selected item, give the
@@ -3363,6 +3412,16 @@ task.spawn(function()
 	end
 end)
 
+-- Poll for changed stock/restocks; the signature prevents needless dropdown rebuilds.
+task.spawn(function()
+	while gui.Parent do
+		if AutoBuy.built then
+			pcall(AutoBuy.queueRefreshOptions)
+		end
+		local interval = tonumber(AutoBuy.Config and AutoBuy.Config.STOCK_POLL_INTERVAL) or 5
+		task.wait(math.max(1, interval))
+	end
+end)
 -- Render once data loads, then refresh on changes with a slow safety-net pass.
 task.spawn(function()
 	local nextLoadTry, nextHookTry, lastRender = 0, 0, 0
@@ -3622,8 +3681,15 @@ local function refreshGui()
 
 	-- Auto Roll
 	-- each successful Roll call rolls CONFIG.RollAmount dice
-	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls * CONFIG.RollAmount))
+	-- State.Rolls counts dice returned by successful Roll calls.
+	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls))
 	leafBalance.Text = ("Leaf Balance: %s"):format(formatNumber(leafBalanceValue))
+	local pooledResults = {}
+	for unitId, counts in pairs(State.RollResultPool) do
+		table.insert(pooledResults, ("%s x%d (auto-sold %d)"):format(unitId, counts.total, counts.autoSold))
+	end
+	table.sort(pooledResults)
+	rollResultsLine.Text = "Results: " .. (#pooledResults > 0 and table.concat(pooledResults, ", ") or "None yet")
 
 	-- Auto Tower
 	local S = State.TowerStats
@@ -4414,6 +4480,7 @@ local function Unload()
 	runId += 1
 	towerRunId += 1
 	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	if AutoBuy.refreshEvent then pcall(function() AutoBuy.refreshEvent:Destroy() end) end
 	for _, c in ipairs(AutoBuy.dataHooks) do pcall(function() c:Disconnect() end) end
 	if gui then gui:Destroy() end
 	env.AutumnDice = nil
