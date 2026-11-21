@@ -1,10 +1,16 @@
+----------------------------------------------------------------------
+-- Services
+----------------------------------------------------------------------
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
-local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
 
-local STARTUP_DELAY = 6 
+----------------------------------------------------------------------
+-- Startup gate: do NOTHING until the game has fully loaded.
+-- After a rejoin / server hop the script can be executed while the game is still starting,
+-- and touching its modules, remotes or UI that early can break the game's own loading.
+----------------------------------------------------------------------
+local STARTUP_DELAY = 6   -- extra seconds of grace once everything below is ready
 do
 	if not game:IsLoaded() then game.Loaded:Wait() end
 
@@ -15,7 +21,7 @@ do
 	end
 
 	lp:WaitForChild("PlayerGui")
-	ReplicatedStorage:WaitForChild("Framework", 60) 
+	ReplicatedStorage:WaitForChild("Framework", 60) -- the game's own controllers live here
 
 	local deadline = os.clock() + 30
 	while not lp.Character and os.clock() < deadline do
@@ -32,6 +38,7 @@ end
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
+-- Clean up a previous instance if the script is executed twice
 if env.AutumnDice and env.AutumnDice.Unload then
 	pcall(env.AutumnDice.Unload)
 end
@@ -44,7 +51,7 @@ local CONFIG = {
 
 	-- Auto Roll
 	RollAmount = 5,           -- argument passed to LeafDiceService.RF.Roll
-	RollDelay = 0.5,          -- seconds to wait AFTER a roll finishes, before the next one
+	RollDelay = 0.2,          -- seconds to wait AFTER a roll finishes, before the next one
 	MaxRollErrors = 5,        -- consecutive failed rolls before the loop stops itself
 	RollErrorDelay = 3,       -- seconds to wait after a failed roll before trying again
 
@@ -77,9 +84,13 @@ local CONFIG = {
 }
 
 local TOWER_MODES = { "Single", "Best Leaf Tower" }
+
+----------------------------------------------------------------------
+-- State (single source of truth; GUI listens to it)
+----------------------------------------------------------------------
 local State = {
 	Features = {
-		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false, AutoBuy = false, FloatingButton = true,
+		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false, AutoBuy = false,
 		-- Miscellaneous
 		AntiAfk = false, AutoReconnect = false, AutoClaimQuest = false,
 	},
@@ -87,7 +98,6 @@ local State = {
 	Detail = "Enable \"Auto Roll Autumn Dice\" to start.",
 	Hotkey = CONFIG.DefaultHotkey,
 	Rolls = 0,
-	RollResultPool = {},
 
 	TowerMode = "Best Leaf Tower",
 	SelectedTower = nil,
@@ -344,7 +354,7 @@ function AutumnTravel.ensureInAutumnWorld(shouldContinue)
 	if not AutumnTravel.isInAutumnWorld() then return finish(false, "Timed out waiting for Autumn World.") end
 	return finish(true)
 end
-function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin, destinationOffset)
+function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin)
     local zone = AutumnTravel.findZone(zoneName)
     if not zone then return false, "Zone not found: " .. tostring(zoneName) end
     local root = getHRP(15)
@@ -354,7 +364,6 @@ function AutumnTravel.pivotToZone(zoneName, shouldContinue, margin, destinationO
     local offsets = zoneName == "LeafDice"
         and { Vector3.zero, Vector3.new(12, 0, 0), Vector3.new(-12, 0, 0), Vector3.new(0, 0, 12), Vector3.new(0, 0, -12) }
         or { Vector3.zero, Vector3.new(3, 0, 0), Vector3.new(-3, 0, 0), Vector3.new(0, 0, 3), Vector3.new(0, 0, -3) }
-    if destinationOffset then table.insert(offsets, 1, destinationOffset) end
     local character = player.Character
     local rootOffset = character:GetPivot():ToObjectSpace(root.CFrame)
     for _, offset in ipairs(offsets) do
@@ -463,7 +472,7 @@ local function runSetup(id, owner)
 		SetStatus("Moving")
 		moved, err = AutumnTravel.pivotToZone("LeafDice", function()
 			return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested
-		end, 10, Vector3.new(12, 0, 0))
+		end, 10)
 		if moved then break end
 
 		AutumnTravel.release(owner)
@@ -483,20 +492,6 @@ local function isAtLeafDice()
 	return AutumnTravel.isNearZone("LeafDice", 10)
 end
 
-local function poolRollResults(results)
-	for _, entry in ipairs(results) do
-		if type(entry) == "table" and entry.result ~= nil then
-			local unitId = tostring(entry.result)
-			local counts = State.RollResultPool[unitId]
-			if not counts then
-				counts = { total = 0, autoSold = 0 }
-				State.RollResultPool[unitId] = counts
-			end
-			counts.total += 1
-			if entry.autoSold then counts.autoSold += 1 end
-		end
-	end
-end
 local function rollLoop(id, rollRemote)
 	local consecutiveErrors = 0
 	State.Rolls = 0
@@ -515,7 +510,7 @@ local function rollLoop(id, rollRemote)
 				local moved, err = true, nil
 				if not isAtLeafDice() then
 					SetStatus("Moving", "Returning to the LeafDice zone before rolling.")
-					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested end, 10, Vector3.new(12, 0, 0))
+					moved, err = AutumnTravel.pivotToZone("LeafDice", function() return alive(id) and not AutumnTravel.questRequested and not AutumnTravel.autoQuestMoving and not AutumnTravel.autoQuestRequested and not AutumnTravel.buyRequested end, 10)
 				end
 				if not moved or not isAtLeafDice() then
 					AutumnTravel.release(owner)
@@ -534,17 +529,11 @@ local function rollLoop(id, rollRemote)
 					if not called then ok, result = false, ok end
 					if not alive(id) then return end
 
-					if ok and type(result) == "table" then
-						local rolledCount = math.max(#result, 1)
+					if ok and result ~= false then
 						consecutiveErrors = 0
-						poolRollResults(result)
-						State.Rolls += rolledCount
+						State.Rolls += 1
 						SetStatus("AutoRollEnabled", ("The custom rolling loop is active. Rolls completed: %d"):format(State.Rolls))
 						if not sleep(id, CONFIG.RollDelay) then return end
-					elseif ok then
-						local reason = result == nil and "rejected by server" or ("rejected by server: " .. tostring(result))
-						SetStatus("Error", reason .. " (not counted toward MaxRollErrors)")
-						if not sleep(id, CONFIG.RollErrorDelay) then return end
 					else
 						consecutiveErrors += 1
 						local msg = ("Roll failed (%d/%d): %s"):format(consecutiveErrors, CONFIG.MaxRollErrors, tostring(result))
@@ -1215,7 +1204,6 @@ local function setAutoReconnect(enabled)
 	-- intentionally empty: no connections, no saved server, no teleports
 end
 local setAutoClaim
-local floatingButton
 local AutoBuy = {} -- filled in by the Auto Buy section (Event tab)
 local setAutoQuest
 
@@ -1261,9 +1249,6 @@ local function SetFeature(name, value)
 		notify()
 	elseif name == "AutoBuy" then
 		if AutoBuy.setEnabled then AutoBuy.setEnabled(value) end
-		notify()
-	elseif name == "FloatingButton" then
-		if floatingButton then floatingButton.Visible = value end
 		notify()
 	else
 		notify()
@@ -1550,10 +1535,10 @@ catcher.MouseButton1Click:Connect(closeDropdowns)
 -- Layout: side navigation (left) + one page per tab (right) ----------------
 local SIDEBAR_GAP = 8
 
--- fills the space below the title bar
+-- fills the space between the title bar (top) and the footer (bottom)
 local bodyRow = create("Frame", {
 	Position = UDim2.fromOffset(0, 26),
-	Size = UDim2.new(1, 0, 1, -32),
+	Size = UDim2.new(1, 0, 1, -52),
 	BackgroundTransparency = 1,
 	Parent = main,
 })
@@ -2356,10 +2341,8 @@ local rollInfo = create("Frame", {
 	Parent = rollBody,
 }, { vlist(4) })
 
-local rollResultsLine = makeLine(rollInfo, 1, 11, THEME.subtext)
-rollResultsLine.Text = "Results: None yet"
-local rollCount = makeLine(rollInfo, 2, 12, THEME.subtext)
-local leafBalance = makeLine(rollInfo, 3, 12, THEME.subtext)
+local rollCount = makeLine(rollInfo, 1, 12, THEME.subtext)
+local leafBalance = makeLine(rollInfo, 2, 12, THEME.subtext)
 local leafBalanceValue = 0
 local leafBalanceHooked = false
 task.spawn(function()
@@ -2452,129 +2435,7 @@ end, "Miscellaneous")
 
 makeToggle(miscBody, 1, "Anti AFK", "AntiAfk")
 makeToggle(miscBody, 2, "Auto Reconnect", "AutoReconnect")
-makeToggle(miscBody, 3, "Floating GUI Button", "FloatingButton")
 
-local teleportPending = false
-local visitedServers = {}
-local rejoinButton, serverHopButton
-
-local function teleportToInstance(jobId, label)
-	if teleportPending then return false end
-	if game.PlaceId <= 0 or type(jobId) ~= "string" or jobId == "" then
-		warn(label .. " failed: this server has no valid instance ID.")
-		return false
-	end
-	teleportPending = true
-	local ok, err = pcall(function()
-		TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, player)
-	end)
-	if not ok then
-		teleportPending = false
-		warn(label .. " failed: " .. tostring(err))
-		return false
-	end
-	return true
-end
-
-local function RejoinServer()
-	if game.JobId == "" then
-		warn("Rejoin failed: the current server has no Job ID.")
-		return false
-	end
-	return teleportToInstance(game.JobId, "Rejoin")
-end
-
-local function ServerHop()
-	if teleportPending then return false end
-	local httpRequest = (syn and syn.request) or http_request or request
-	if type(httpRequest) ~= "function" then
-		warn("Server Hop failed: this environment does not provide an HTTP request function.")
-		return false
-	end
-	teleportPending = true
-	task.spawn(function()
-		local ok, result = pcall(function()
-			local cursor, candidates = "", {}
-			for _ = 1, 5 do
-				local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true%s")
-					:format(game.PlaceId, cursor ~= "" and "&cursor=" .. HttpService:UrlEncode(cursor) or "")
-				local response = httpRequest({ Url = url, Method = "GET" })
-				local status = tonumber(response.StatusCode or response.Status or response.status_code)
-				if response.Success == false or (status and status ~= 200) then
-					error("server list request returned " .. tostring(status or "an error"))
-				end
-				local page = HttpService:JSONDecode(response.Body or response.body or "")
-				for _, server in ipairs(page.data or {}) do
-					if server.id ~= game.JobId and (server.playing or 0) < (server.maxPlayers or 0) then
-						table.insert(candidates, server.id)
-					end
-				end
-				cursor = page.nextPageCursor or ""
-				if #candidates > 0 or cursor == "" then break end
-			end
-			local fresh = {}
-			for _, id in ipairs(candidates) do
-				if not visitedServers[id] then table.insert(fresh, id) end
-			end
-			local pool = #fresh > 0 and fresh or candidates
-			if #pool == 0 then error("no other available public servers were found") end
-			local jobId = pool[math.random(1, #pool)]
-			visitedServers[jobId] = true
-			return jobId
-		end)
-		if not ok then
-			teleportPending = false
-			warn("Server Hop failed: " .. tostring(result))
-			return
-		end
-		local started, err = pcall(function()
-			TeleportService:TeleportToPlaceInstance(game.PlaceId, result, player)
-		end)
-		if not started then
-			teleportPending = false
-			warn("Server Hop failed: " .. tostring(err))
-		end
-	end)
-	return true
-end
-
-table.insert(connections, TeleportService.TeleportInitFailed:Connect(function(failedPlayer, result, message)
-	if failedPlayer == player then
-		teleportPending = false
-		warn(("Teleport failed (%s): %s"):format(tostring(result), tostring(message)))
-	end
-end))
-
-local teleportButtonsRow = create("Frame", {
-	LayoutOrder = 5,
-	Size = UDim2.new(1, 0, 0, 28),
-	BackgroundTransparency = 1,
-	Parent = miscBody,
-}, { create("UIListLayout", {
-	FillDirection = Enum.FillDirection.Horizontal,
-	Padding = UDim.new(0, 8),
-	SortOrder = Enum.SortOrder.LayoutOrder,
-}) })
-
-local function makeTeleportButton(order, label, callback)
-	local button = create("TextButton", {
-		LayoutOrder = order,
-		Size = UDim2.new(0.5, -4, 0, 28),
-		BackgroundColor3 = THEME.field,
-		BorderSizePixel = 0,
-		Text = label,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 12,
-		TextColor3 = THEME.text,
-		AutoButtonColor = false,
-		Parent = teleportButtonsRow,
-	}, { corner(8), stroke(THEME.stroke) })
-	button.MouseButton1Click:Connect(callback)
-	return button
-end
-
-rejoinButton = makeTeleportButton(1, "Rejoin", RejoinServer)
-serverHopButton = makeTeleportButton(2, "Server Hop", ServerHop)
 ----------------------------------------------------------------------
 -- Tab: Event -> Quest card (local player's Autumn quests, Daily + Hourly)
 -- Data comes from DataController[period.dataKey]() and AutumnQuestConfig, the same way the
@@ -3186,13 +3047,8 @@ end
 function AutoBuy.refreshOptions()
 	if not AutoBuy.built or not AutoBuy.dropdown then return end
 
-	-- Re-read the shop config so newly stocked or restocked items are picked up.
 	local offers = AutoBuy.Config and AutoBuy.Config.Offers
-	if type(offers) == "table" then
-		AutoBuy.offers = uniqueOffers(offers)
-	else
-		AutoBuy.offers = uniqueOffers(AutoBuy.offers)
-	end
+	AutoBuy.offers = uniqueOffers(type(offers) == "table" and offers or AutoBuy.offers)
 
 	local options, signature = {}, {}
 	for _, offer in ipairs(AutoBuy.offers) do
@@ -3205,6 +3061,7 @@ function AutoBuy.refreshOptions()
 	AutoBuy.stockKey = key
 	AutoBuy.dropdown.SetOptions(options)
 end
+
 local refreshQueued = false
 AutoBuy.refreshEvent = Instance.new("BindableEvent")
 table.insert(connections, AutoBuy.refreshEvent.Event:Connect(function()
@@ -3397,7 +3254,7 @@ task.spawn(function()
 	end
 end)
 
--- Poll for changed stock/restocks; the signature prevents needless dropdown rebuilds.
+-- Poll for changed stock/restocks without rebuilding unchanged dropdown options.
 task.spawn(function()
 	while gui.Parent do
 		if AutoBuy.built then
@@ -3433,154 +3290,67 @@ refreshColumns()
 selectTab("Roll")
 
 ----------------------------------------------------------------------
--- GUI visibility controls ---------------------------------------------------
+-- Footer: hotkey
+----------------------------------------------------------------------
 local hotkeyRow = create("Frame", {
-    LayoutOrder = 4,
-    Size = UDim2.new(1, 0, 0, 22),
-    BackgroundTransparency = 1,
-    Parent = miscBody,
-}, { pad(2, 2, 2, 2) })
+	Position = UDim2.new(0, 0, 1, -22),
+	Size = UDim2.new(1, 0, 0, 22),
+	BackgroundTransparency = 1,
+	Parent = main,
+}, { pad(2, 0, 2, 0) })
 create("TextLabel", {
-    Size = UDim2.new(0.5, 0, 1, 0),
-    BackgroundTransparency = 1,
-    Text = "Show / hide GUI",
-    Font = Enum.Font.GothamMedium,
-    TextSize = 13,
-    TextColor3 = THEME.text,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Parent = hotkeyRow,
+	Size = UDim2.new(0.5, 0, 1, 0),
+	BackgroundTransparency = 1,
+	Text = "Show / hide GUI",
+	Font = Enum.Font.Gotham,
+	TextSize = 11,
+	TextColor3 = THEME.subtext,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	Parent = hotkeyRow,
 })
 local hotkeyBtn = create("TextButton", {
-    Size = UDim2.fromOffset(104, 20),
-    Position = UDim2.new(1, -104, 0.5, -10),
-    BackgroundColor3 = THEME.field,
-    Text = "",
-    Font = Enum.Font.GothamBold,
-    TextSize = 11,
-    TextColor3 = THEME.accent,
-    AutoButtonColor = false,
-    Parent = hotkeyRow,
+	Size = UDim2.fromOffset(104, 20),
+	Position = UDim2.new(1, -104, 0.5, -10),
+	BackgroundColor3 = THEME.field,
+	Text = "",
+	Font = Enum.Font.GothamBold,
+	TextSize = 11,
+	TextColor3 = THEME.accent,
+	AutoButtonColor = false,
+	Parent = hotkeyRow,
 }, { corner(8), stroke(THEME.stroke) })
-
-local function setMainVisible(visible)
-    main.Visible = visible
-    if not visible then closeDropdowns() end
-end
-
-local function toggleMainVisibility()
-    setMainVisible(not main.Visible)
-end
-
-floatingButton = create("TextButton", {
-    Name = "FloatingGuiToggle",
-    AnchorPoint = Vector2.zero,
-    Position = UDim2.new(0.5, -21, 0.15, 0),
-    Size = UDim2.fromOffset(42, 42),
-    BackgroundColor3 = THEME.card,
-    BorderSizePixel = 0,
-    Text = "◉",
-    Font = Enum.Font.GothamBold,
-    TextSize = 22,
-    TextColor3 = THEME.accent,
-    AutoButtonColor = false,
-    Active = true,
-    Visible = State.Features.FloatingButton,
-    ZIndex = 50,
-    Parent = gui,
-}, { corner(21), stroke(THEME.stroke) })
-
-local function clampFloatingButton(position)
-    local cam = workspace.CurrentCamera
-    local viewport = cam and cam.ViewportSize or Vector2.new(1280, 720)
-    local current = position or floatingButton.AbsolutePosition
-    local maxX = math.max(0, viewport.X - floatingButton.AbsoluteSize.X)
-    local maxY = math.max(0, viewport.Y - floatingButton.AbsoluteSize.Y)
-    floatingButton.Position = UDim2.fromOffset(math.clamp(current.X, 0, maxX), math.clamp(current.Y, 0, maxY))
-end
-
-do
-    local pointerDown, dragging = false, false
-    local pointerType, touchInput = nil, nil
-    local startInput = nil
-
-    table.insert(connections, floatingButton.InputBegan:Connect(function(input)
-        if pointerDown or (input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch) then
-            return
-        end
-        pointerDown = true
-        dragging = false
-        pointerType = input.UserInputType
-        touchInput = pointerType == Enum.UserInputType.Touch and input or nil
-        startInput = pointerType == Enum.UserInputType.MouseButton1 and UserInputService:GetMouseLocation() or Vector2.new(input.Position.X, input.Position.Y)
-    end))
-
-    table.insert(connections, UserInputService.InputChanged:Connect(function(input)
-        local isPointerMove = (pointerType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement)
-            or (touchInput ~= nil and input == touchInput)
-        if not pointerDown or not isPointerMove then return end
-
-        local point = pointerType == Enum.UserInputType.MouseButton1 and UserInputService:GetMouseLocation() or Vector2.new(input.Position.X, input.Position.Y)
-        local delta = point - startInput
-        if delta.Magnitude > 5 then dragging = true end
-        if dragging then clampFloatingButton(point - floatingButton.AbsoluteSize / 2) end
-    end))
-
-    table.insert(connections, UserInputService.InputEnded:Connect(function(input)
-        local pointerEnded = (pointerType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)
-            or (touchInput ~= nil and input == touchInput)
-        if not pointerDown or not pointerEnded then return end
-
-        if not dragging then toggleMainVisibility() end
-        pointerDown, dragging, pointerType, touchInput = false, false, nil, nil
-        startInput = nil
-    end))
-end
-
-local floatingCameraConn
-local function watchFloatingCamera()
-    if floatingCameraConn then floatingCameraConn:Disconnect() floatingCameraConn = nil end
-    local cam = workspace.CurrentCamera
-    if cam then
-        floatingCameraConn = cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-            clampFloatingButton()
-        end)
-        table.insert(connections, floatingCameraConn)
-    end
-end
-watchFloatingCamera()
-table.insert(connections, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchFloatingCamera))
 
 local listeningForKey = false
 local function refreshHotkey()
-        hotkeyBtn.Text = listeningForKey and "Press a key..." or ("[ " .. State.Hotkey.Name .. " ]")
-    end
+	hotkeyBtn.Text = listeningForKey and "Press a key..." or ("[ " .. State.Hotkey.Name .. " ]")
+end
 
-    hotkeyBtn.MouseButton1Click:Connect(function()
-        if listeningForKey then return end
-        listeningForKey = true
-        refreshHotkey()
-        local conn
-        conn = UserInputService.InputBegan:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-            conn:Disconnect()
-            if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
-                State.Hotkey = input.KeyCode
-            end
-            task.delay(0.15, function()
-                listeningForKey = false
-                refreshHotkey()
-            end)
-        end)
-    end)
+hotkeyBtn.MouseButton1Click:Connect(function()
+	if listeningForKey then return end
+	listeningForKey = true
+	refreshHotkey()
+	local conn
+	conn = UserInputService.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+		conn:Disconnect()
+		if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
+			State.Hotkey = input.KeyCode
+		end
+		task.delay(0.15, function()
+			listeningForKey = false
+			refreshHotkey()
+		end)
+	end)
+end)
 
-    table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if gameProcessed or listeningForKey then return end
-        if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == State.Hotkey then
-            toggleMainVisibility()
-        end
-    end))
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed or listeningForKey then return end
+	if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == State.Hotkey then
+		main.Visible = not main.Visible
+		if not main.Visible then closeDropdowns() end
+	end
+end))
 
-table.insert(refreshers, refreshHotkey)
 -- Dragging
 do
 	local dragging, dragStart, startPos
@@ -3665,15 +3435,9 @@ local function refreshGui()
 	for _, fn in ipairs(refreshers) do fn() end
 
 	-- Auto Roll
-	-- State.Rolls counts dice returned by successful Roll calls.
-	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls))
+	-- each successful Roll call rolls CONFIG.RollAmount dice
+	rollCount.Text = ("Rolls: %s"):format(formatNumber(State.Rolls * CONFIG.RollAmount))
 	leafBalance.Text = ("Leaf Balance: %s"):format(formatNumber(leafBalanceValue))
-	local pooledResults = {}
-	for unitId, counts in pairs(State.RollResultPool) do
-		table.insert(pooledResults, ("%s x%d (auto-sold %d)"):format(unitId, counts.total, counts.autoSold))
-	end
-	table.sort(pooledResults)
-	rollResultsLine.Text = "Results: " .. (#pooledResults > 0 and table.concat(pooledResults, ", ") or "None yet")
 
 	-- Auto Tower
 	local S = State.TowerStats
@@ -4477,8 +4241,6 @@ env.AutumnDice = {
 	GetFeature = GetFeature,
 	SetTowerMode = SetTowerMode,
 	SetSelectedTower = SetSelectedTower,
-	RejoinServer = RejoinServer,
-	ServerHop = ServerHop,
 	GetStatus = function() return State.Status, State.Detail end,
 	GetTowerStatus = function() return State.TowerStatus, State.TowerDetail end,
 	SetHotkey = function(keyCode) State.Hotkey = keyCode notify() end,
