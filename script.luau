@@ -1,18 +1,10 @@
-----------------------------------------------------------------------
--- Services
-----------------------------------------------------------------------
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 
-----------------------------------------------------------------------
--- Startup gate: do NOTHING until the game has fully loaded.
--- After a rejoin / server hop the script can be executed while the game is still starting,
--- and touching its modules, remotes or UI that early can break the game's own loading.
-----------------------------------------------------------------------
-local STARTUP_DELAY = 6   -- extra seconds of grace once everything below is ready
+local STARTUP_DELAY = 6 
 do
 	if not game:IsLoaded() then game.Loaded:Wait() end
 
@@ -23,7 +15,7 @@ do
 	end
 
 	lp:WaitForChild("PlayerGui")
-	ReplicatedStorage:WaitForChild("Framework", 60) -- the game's own controllers live here
+	ReplicatedStorage:WaitForChild("Framework", 60) 
 
 	local deadline = os.clock() + 30
 	while not lp.Character and os.clock() < deadline do
@@ -40,7 +32,6 @@ end
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
 
--- Clean up a previous instance if the script is executed twice
 if env.AutumnDice and env.AutumnDice.Unload then
 	pcall(env.AutumnDice.Unload)
 end
@@ -86,10 +77,6 @@ local CONFIG = {
 }
 
 local TOWER_MODES = { "Single", "Best Leaf Tower" }
-
-----------------------------------------------------------------------
--- State (single source of truth; GUI listens to it)
-----------------------------------------------------------------------
 local State = {
 	Features = {
 		AutoDice = false, AutoTower = false, AutoEquipBest = false, AutoQuest = false, AutoBuy = false, FloatingButton = true,
