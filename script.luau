@@ -3594,22 +3594,22 @@ end))
 
 -- Dragging
 do
-	local dragging, dragStart, startPos
+	local drag = {}
 	table.insert(connections, titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			closeDropdowns()
-			dragging, dragStart, startPos = true, input.Position, main.Position
+			drag.dragging, drag.dragStart, drag.startPos = true, input.Position, main.Position
 		end
 	end))
 	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			local delta = input.Position - dragStart
-			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		if drag.dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - drag.dragStart
+			main.Position = UDim2.new(drag.startPos.X.Scale, drag.startPos.X.Offset + delta.X, drag.startPos.Y.Scale, drag.startPos.Y.Offset + delta.Y)
 		end
 	end))
 	table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
+			drag.dragging = false
 		end
 	end))
 end
